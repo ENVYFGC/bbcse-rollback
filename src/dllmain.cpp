@@ -1458,6 +1458,132 @@ void* WINAPI HookD3DCreate(UINT sdk) {
 	return d3d;
 }
 
+constexpr DWORD kIatSteamRemoteStorage = 0x90439C;
+constexpr DWORD kAppId = 294810;
+std::string g_cloudDir;
+using SteamRemoteStorage_t = void*(__cdecl*)();
+SteamRemoteStorage_t g_origRemoteStorage = nullptr;
+bool g_cloudHooked = false;
+
+bool CloudName(const char* name, std::string& path) {
+	if (!name || !*name || strpbrk(name, "\\/:") || strstr(name, "..")) return false;
+	path = g_cloudDir + name;
+	return true;
+}
+bool __fastcall CloudFileWrite(void*, void*, const char* name, const void* data, int size) {
+	std::string path;
+	if (!CloudName(name, path) || size < 0) return false;
+	FILE* f = nullptr;
+	if (fopen_s(&f, path.c_str(), "wb") != 0 || !f) { Log("CLOUD: write %s FAILED", name); return false; }
+	const bool ok = fwrite(data, 1, static_cast<size_t>(size), f) == static_cast<size_t>(size);
+	fclose(f);
+	Log("CLOUD: write %s, %d bytes%s", name, size, ok ? "" : " FAILED");
+	return ok;
+}
+int __fastcall CloudFileRead(void*, void*, const char* name, void* data, int cap) {
+	std::string path;
+	if (!CloudName(name, path) || cap <= 0) return 0;
+	FILE* f = nullptr;
+	if (fopen_s(&f, path.c_str(), "rb") != 0 || !f) { Log("CLOUD: read %s: not found", name); return 0; }
+	const int got = static_cast<int>(fread(data, 1, static_cast<size_t>(cap), f));
+	fclose(f);
+	Log("CLOUD: read %s, %d bytes", name, got);
+	return got;
+}
+bool __fastcall CloudFileDelete(void*, void*, const char* name) {
+	std::string path;
+	if (!CloudName(name, path)) return false;
+	Log("CLOUD: delete %s", name);
+	return DeleteFileA(path.c_str()) != FALSE;
+}
+bool __fastcall CloudFileExists(void*, void*, const char* name) {
+	std::string path;
+	return CloudName(name, path) && GetFileAttributesA(path.c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+int __fastcall CloudGetFileSize(void*, void*, const char* name) {
+	std::string path;
+	WIN32_FILE_ATTRIBUTE_DATA fa{};
+	if (!CloudName(name, path) || !GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &fa)) return 0;
+	return static_cast<int>(fa.nFileSizeLow);
+}
+long long __fastcall CloudGetFileTimestamp(void*, void*, const char* name) {
+	std::string path;
+	WIN32_FILE_ATTRIBUTE_DATA fa{};
+	if (!CloudName(name, path) || !GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &fa)) return 0;
+	const unsigned long long t = (static_cast<unsigned long long>(fa.ftLastWriteTime.dwHighDateTime) << 32) |
+	                             fa.ftLastWriteTime.dwLowDateTime;
+	return static_cast<long long>(t / 10000000ULL - 11644473600ULL);
+}
+bool __fastcall CloudGetQuota(void*, void*, int* total, int* available) {
+	if (total) *total = 100 << 20;
+	if (available) *available = 99 << 20;
+	return true;
+}
+bool __fastcall CloudEnabled(void*, void*) { return true; }
+
+void ImportSteamCloudCopy(void* storage) {
+	std::string local;
+	if (!CloudName("DCARD.UMS", local) || GetFileAttributesA(local.c_str()) != INVALID_FILE_ATTRIBUTES) return;
+	char steamPath[MAX_PATH] = {};
+	DWORD len = sizeof(steamPath);
+	if (RegGetValueA(HKEY_CURRENT_USER, "Software\\Valve\\Steam", "SteamPath", RRF_RT_REG_SZ, nullptr, steamPath, &len) != ERROR_SUCCESS)
+		return;
+	using SteamUser_t = void*(__cdecl*)();
+	const auto steamUser = reinterpret_cast<SteamUser_t>(GetProcAddress(GetModuleHandleA("steam_api.dll"), "SteamUser"));
+	void* user = steamUser ? steamUser() : nullptr;
+	if (!user) return;
+	unsigned long long id = 0;
+	using GetSteamID_t = unsigned long long*(__fastcall*)(void* self, void* edx, unsigned long long* out);
+	(*reinterpret_cast<GetSteamID_t*>(*reinterpret_cast<BYTE**>(user) + 8))(user, nullptr, &id);
+	char src[MAX_PATH];
+	sprintf_s(src, "%s\\userdata\\%lu\\%lu\\remote\\DCARD.UMS", steamPath, static_cast<unsigned long>(id & 0xFFFFFFFF), kAppId);
+	if (CopyFileA(src, local.c_str(), TRUE)) Log("CLOUD: imported your old online profile from %s", src);
+	else Log("CLOUD: no old online profile at %s (a new one will be made)", src);
+	(void)storage;
+}
+
+void PatchCloudSlot(void** vt, int slot, void* fn) {
+	DWORD old;
+	VirtualProtect(&vt[slot], sizeof(void*), PAGE_EXECUTE_READWRITE, &old);
+	vt[slot] = fn;
+	VirtualProtect(&vt[slot], sizeof(void*), old, &old);
+}
+void* __cdecl HookSteamRemoteStorage() {
+	void* storage = g_origRemoteStorage();
+	if (storage && !g_cloudHooked) {
+		g_cloudHooked = true;
+		void** vt = *reinterpret_cast<void***>(storage);
+		PatchCloudSlot(vt, 0, reinterpret_cast<void*>(&CloudFileWrite));
+		PatchCloudSlot(vt, 1, reinterpret_cast<void*>(&CloudFileRead));
+		PatchCloudSlot(vt, 3, reinterpret_cast<void*>(&CloudFileDelete));
+		PatchCloudSlot(vt, 10, reinterpret_cast<void*>(&CloudFileExists));
+		PatchCloudSlot(vt, 11, reinterpret_cast<void*>(&CloudFileExists));
+		PatchCloudSlot(vt, 12, reinterpret_cast<void*>(&CloudGetFileSize));
+		PatchCloudSlot(vt, 13, reinterpret_cast<void*>(&CloudGetFileTimestamp));
+		PatchCloudSlot(vt, 17, reinterpret_cast<void*>(&CloudGetQuota));
+		PatchCloudSlot(vt, 18, reinterpret_cast<void*>(&CloudEnabled));
+		PatchCloudSlot(vt, 19, reinterpret_cast<void*>(&CloudEnabled));
+		CreateDirectoryA(g_cloudDir.c_str(), nullptr);
+		ImportSteamCloudCopy(storage);
+		Log("CLOUD: online profile kept in %s (Steam Cloud is off for this game)", g_cloudDir.c_str());
+	}
+	return storage;
+}
+
+void InstallCloudFix(HMODULE self) {
+	g_cloudDir = ModuleDir(self) + "bbcse-cloud\\";
+	BYTE* base = reinterpret_cast<BYTE*>(GetModuleHandleA(nullptr));
+	void** slot = reinterpret_cast<void**>(base + (kIatSteamRemoteStorage - kImage));
+	HMODULE api = GetModuleHandleA("steam_api.dll");
+	void* real = api ? reinterpret_cast<void*>(GetProcAddress(api, "SteamRemoteStorage")) : nullptr;
+	if (!real || *slot != real) { Log("CLOUD: not installed (import slot %p holds %p, export %p)", slot, *slot, real); return; }
+	DWORD old;
+	VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &old);
+	g_origRemoteStorage = reinterpret_cast<SteamRemoteStorage_t>(real);
+	*slot = reinterpret_cast<void*>(&HookSteamRemoteStorage);
+	VirtualProtect(slot, sizeof(void*), old, &old);
+}
+
 void InstallVsyncOff(HMODULE self) {
 	const std::string ini = ModuleDir(self) + "bbcse-net.ini";
 	char mode[16] = {};
@@ -2671,6 +2797,7 @@ BOOL APIENTRY DllMain(HMODULE self, DWORD reason, LPVOID) {
 	ReportProcess();
 	LoadRealDinput();
 	InstallVsyncOff(self);
+	InstallCloudFix(self);
 
 	return TRUE;
 }
