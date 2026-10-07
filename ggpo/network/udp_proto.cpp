@@ -314,6 +314,19 @@ UdpProtocol::OnMsg(UdpMsg *msg, int len)
       &UdpProtocol::OnInputAck,            /* InputAck */
    };
 
+   // bbcse: validate before anything reads the message. Every field below comes from the
+   // peer; a short, oversized or unknown packet is dropped instead of being decoded (an
+   // Invalid type used to reach OnInvalid's ASSERT, which exits the game).
+   if (len < (int)sizeof(msg->hdr) || msg->hdr.type == UdpMsg::Invalid || msg->hdr.type >= ARRAY_SIZE(table)) {
+      return;
+   }
+   if (msg->hdr.type == UdpMsg::Input && msg->u.input.num_bits > MAX_COMPRESSED_BITS) {
+      return;
+   }
+   if (len < msg->PacketSize()) {
+      return;
+   }
+
    // filter out messages that don't match what we expect
    uint16 seq = msg->hdr.sequence_number;
    if (msg->hdr.type != UdpMsg::SyncRequest &&
@@ -533,7 +546,7 @@ UdpProtocol::OnInput(UdpMsg *msg, int len)
        */
       UdpMsg::connect_status* remote_status = msg->u.input.peer_connect_status;
       for (int i = 0; i < ARRAY_SIZE(_peer_connect_status); i++) {
-         ASSERT(remote_status[i].last_frame >= _peer_connect_status[i].last_frame);
+         // bbcse: was ASSERT (peer data): an older status is simply not applied (MAX below)
          _peer_connect_status[i].disconnected = _peer_connect_status[i].disconnected || remote_status[i].disconnected;
          _peer_connect_status[i].last_frame = MAX(_peer_connect_status[i].last_frame, remote_status[i].last_frame);
       }
@@ -549,6 +562,10 @@ UdpProtocol::OnInput(UdpMsg *msg, int len)
       int numBits = msg->u.input.num_bits;
       int currentFrame = msg->u.input.start_frame;
 
+      // bbcse: the size comes from the peer; out of range = not a real input packet
+      if (msg->u.input.input_size == 0 || msg->u.input.input_size > (int)sizeof(_last_received_input.bits)) {
+         return true;
+      }
       _last_received_input.size = msg->u.input.input_size;
       if (_last_received_input.frame < 0) {
          _last_received_input.frame = msg->u.input.start_frame - 1;
@@ -558,12 +575,26 @@ UdpProtocol::OnInput(UdpMsg *msg, int len)
           * Keep walking through the frames (parsing bits) until we reach
           * the inputs for the frame right after the one we're on.
           */
-         ASSERT(currentFrame <= (_last_received_input.frame + 1));
+         if (currentFrame > (_last_received_input.frame + 1)) {
+            break;  // bbcse: was ASSERT (peer data): a gap in the stream, drop the rest
+         }
          bool useInputs = currentFrame == _last_received_input.frame + 1;
 
-         while (BitVector_ReadBit(bits, &offset)) {
+         // bbcse: every read stays inside num_bits (a change = 1 more bit + a
+         // BITVECTOR_NIBBLE_SIZE-bit button index), and the button index stays inside
+         // GameInput::bits: set()/clear() do no bounds check, so a crafted index from the
+         // peer wrote past the end of the input (memory corruption).
+         while (offset < numBits && BitVector_ReadBit(bits, &offset)) {
+            if (offset + 1 + BITVECTOR_NIBBLE_SIZE > numBits) {
+               offset = numBits + 1;
+               break;
+            }
             int on = BitVector_ReadBit(bits, &offset);
             int button = BitVector_ReadNibblet(bits, &offset);
+            if (button < 0 || button >= (int)sizeof(_last_received_input.bits) * 8) {
+               offset = numBits + 1;
+               break;
+            }
             if (useInputs) {
                if (on) {
                   _last_received_input.set(button);
@@ -572,7 +603,9 @@ UdpProtocol::OnInput(UdpMsg *msg, int len)
                }
             }
          }
-         ASSERT(offset <= numBits);
+         if (offset > numBits) {
+            break;  // bbcse: was ASSERT (peer data): truncated input stream
+         }
 
          /*
           * Now if we want to use these inputs, go ahead and send them to
