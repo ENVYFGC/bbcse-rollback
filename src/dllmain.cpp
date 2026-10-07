@@ -1057,7 +1057,8 @@ constexpr int kPhaseWords = 6;
 struct Slot { std::string r[kRegions]; BYTE* addr[kRegions]; DWORD size[kRegions]; std::string ctrl; ParticleSnap fx;
               DWORD phase[kPhaseWords] = {}; LONG flowGen = 0; LONG frame = -1;
               bool hasScene = false; DWORD scene[3] = {};
-              BYTE* uiPtr[10] = {}; DWORD ui[10][5] = {}; };
+              BYTE* uiPtr[10] = {}; DWORD ui[10][5] = {};
+              DWORD rec[3] = {}; };
 
 void PhaseSignature(const Region r[kRegions], DWORD out[kPhaseWords]) {
 	const BYTE* mgr = r[0].addr;
@@ -1116,7 +1117,15 @@ constexpr DWORD kSceneStateOff = 0x2C, kRoundEndFlag = 0xBCE9F0;
 constexpr int kSceneFighting = 8;
 void* g_sceneForSlots = nullptr;
 
+constexpr DWORD kRecorder = 0x1395378, kRecTotalOff = 0x585E8, kRecRoundOff = 0x585EC, kRecRoundBlock = 0x8D10,
+                kRecRoundCountOff = 0x300;
 void SaveSceneFields(Slot& s) {
+	{
+		BYTE* rec = Live(kRecorder);
+		s.rec[0] = *reinterpret_cast<DWORD*>(rec + kRecTotalOff);
+		s.rec[1] = *reinterpret_cast<DWORD*>(rec + kRecRoundOff);
+		s.rec[2] = s.rec[1] < 8 ? *reinterpret_cast<DWORD*>(rec + s.rec[1] * kRecRoundBlock + kRecRoundCountOff) : 0;
+	}
 	s.hasScene = g_sceneForSlots != nullptr;
 	if (!s.hasScene) return;
 	s.scene[0] = *reinterpret_cast<DWORD*>(static_cast<BYTE*>(g_sceneForSlots) + kSceneStateOff);
@@ -1124,6 +1133,12 @@ void SaveSceneFields(Slot& s) {
 	s.scene[2] = *reinterpret_cast<DWORD*>(Live(0xBC12D8) + 4) & 2;
 }
 void RestoreSceneFields(const Slot& s) {
+	{
+		BYTE* rec = Live(kRecorder);
+		*reinterpret_cast<DWORD*>(rec + kRecTotalOff) = s.rec[0];
+		*reinterpret_cast<DWORD*>(rec + kRecRoundOff) = s.rec[1];
+		if (s.rec[1] < 8) *reinterpret_cast<DWORD*>(rec + s.rec[1] * kRecRoundBlock + kRecRoundCountOff) = s.rec[2];
+	}
 	if (!s.hasScene || !g_sceneForSlots) return;
 	*reinterpret_cast<DWORD*>(static_cast<BYTE*>(g_sceneForSlots) + kSceneStateOff) = s.scene[0];
 	*reinterpret_cast<DWORD*>(Live(kRoundEndFlag)) = s.scene[1];
@@ -1829,13 +1844,24 @@ bool __cdecl NetLoad(unsigned char* buf, int) {
 bool __cdecl NetLogState(char*, unsigned char*, int) { return true; }
 void __cdecl NetFree(void* buf) { if (buf) g_slotFree.push_back(static_cast<Slot*>(buf)); }
 
+constexpr DWORD kMatchMenuSite = 0x49801C, kMatchMenuFn = 0x56E400;
+using MatchMenu_t = int(__cdecl*)();
+MatchMenu_t g_origMatchMenu = nullptr;
+bool g_inReplayUpdate = false;
+int __cdecl HookMatchMenu() {
+	if (g_net.session && g_inReplayUpdate) return 0;
+	return g_origMatchMenu();
+}
+
 bool __cdecl NetAdvance(int) {
 	int disc = 0;
 	ggpo_synchronize_input(g_net.session, g_netIn, sizeof(g_netIn), &disc);
 	if (SceneFighting()) {
 		struct Add { double t0; ~Add() { g_msResim += NowMs() - t0; } } add{NowMs()};
 		g_netInUpdate = true;
+		g_inReplayUpdate = true;
 		g_origUpdate(g_net.scene, nullptr, 0);
+		g_inReplayUpdate = false;
 		g_netInUpdate = false;
 		EffectStep();
 	}
@@ -1926,8 +1952,21 @@ void* __fastcall HookNetWait(void* self, void* edx, int arg) {
 	*reinterpret_cast<int*>(ns + 0x18) = 0;
 	return self;
 }
+
+int AppliedInputWord(int side) {
+	BYTE* gm = Live(kGameMgr);
+	const int slot = *reinterpret_cast<int*>(gm + kSideSlotOff + 4 * side);
+	if (slot < 0) return -1;
+	using ToWord_t = unsigned short(__fastcall*)(void* gm, void* edx, int slot, unsigned mask, int flip);
+	return reinterpret_cast<ToWord_t>(Live(0x456050))(gm, nullptr, slot, g_netIn[side], 0);
+}
 int __fastcall HookNetSend(void* self, void* edx, unsigned side, unsigned input) {
 	if (SteamMode() && !g_netRealAdvance) return 1;
+
+	if (SteamMode() && side < 2) {
+		const int word = AppliedInputWord(static_cast<int>(side));
+		if (word >= 0) input = static_cast<unsigned>(word);
+	}
 	return g_origNetSend(self, edx, side, input);
 }
 
@@ -1951,7 +1990,15 @@ void LogNetCounters(const char* who) {
 		*reinterpret_cast<WORD*>(ses + 0x11AAC), *reinterpret_cast<WORD*>(ses + 0x11AB0));
 }
 unsigned __fastcall HookNetFetch(void* self, void* edx, int slot) {
-	if (SteamMode()) return 0;
+	if (SteamMode()) {
+		BYTE* gm = Live(kGameMgr);
+		int side = -1;
+		if (*reinterpret_cast<int*>(gm + kSideSlotOff) == slot) side = 0;
+		else if (*reinterpret_cast<int*>(gm + kSideSlotOff + 4) == slot) side = 1;
+		if (side < 0) return 0;
+		const int word = AppliedInputWord(side);
+		return word < 0 ? 0 : static_cast<unsigned>(word);
+	}
 	return g_origNetFetch(self, edx, slot);
 }
 
@@ -2700,6 +2747,7 @@ void InstallTickHook() {
 	g_origNetSend = reinterpret_cast<NetSend_t>(Live(kNetSendFn));
 	g_origNetFetch = reinterpret_cast<NetFetch_t>(Live(kNetFetchFn));
 	g_origNetIndex = reinterpret_cast<NetIndex_t>(Live(kNetIndexFn));
+	g_origMatchMenu = reinterpret_cast<MatchMenu_t>(Live(kMatchMenuFn));
 
 	struct Patch { DWORD site, target; void* hook; };
 	const Patch patches[] = {
@@ -2717,6 +2765,7 @@ void InstallTickHook() {
 		{kNetSendSite, kNetSendFn, reinterpret_cast<void*>(&HookNetSend)},
 		{kNetFetchSite, kNetFetchFn, reinterpret_cast<void*>(&HookNetFetch)},
 		{kNetIndexSite, kNetIndexFn, reinterpret_cast<void*>(&HookNetIndex)},
+		{kMatchMenuSite, kMatchMenuFn, reinterpret_cast<void*>(&HookMatchMenu)},
 	};
 
 	for (const Patch& pt : patches) {
