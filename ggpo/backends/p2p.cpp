@@ -373,7 +373,11 @@ Peer2PeerBackend::OnUdpProtocolPeerEvent(UdpProtocol::Event &evt, int queue)
          if (!_local_connect_status[queue].disconnected) {
             int current_remote_frame = _local_connect_status[queue].last_frame;
             int new_remote_frame = evt.u.input.input.frame;
-            ASSERT(current_remote_frame == -1 || new_remote_frame == (current_remote_frame + 1));
+            // bbcse: peer data; was ASSERT (exit). Wrong size or a frame gap: not added.
+            if (evt.u.input.input.size != _input_size ||
+                (current_remote_frame != -1 && new_remote_frame != (current_remote_frame + 1))) {
+               break;
+            }
 
             _sync.AddRemoteInput(queue, evt.u.input.input);
             // Notify the other endpoints which frame we received from a peer
