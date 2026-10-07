@@ -314,6 +314,10 @@ UdpProtocol::OnMsg(UdpMsg *msg, int len)
       &UdpProtocol::OnInputAck,            /* InputAck */
    };
 
+   if (len < (int)sizeof(msg->hdr) || msg->hdr.type >= ARRAY_SIZE(table)) {
+      return;
+   }
+
    // filter out messages that don't match what we expect
    uint16 seq = msg->hdr.sequence_number;
    if (msg->hdr.type != UdpMsg::SyncRequest &&
@@ -334,11 +338,7 @@ UdpProtocol::OnMsg(UdpMsg *msg, int len)
 
    _next_recv_seq = seq;
    LogMsg("recv", msg);
-   if (msg->hdr.type >= ARRAY_SIZE(table)) {
-      OnInvalid(msg, len);
-   } else {
-      handled = (this->*(table[msg->hdr.type]))(msg, len);
-   }
+   handled = (this->*(table[msg->hdr.type]))(msg, len);
    if (handled) {
       _last_recv_time = Platform::GetCurrentTimeMS();
       if (_disconnect_notify_sent && _current_state == Running) {
@@ -377,6 +377,10 @@ UdpProtocol::UpdateNetworkStats(void)
 void
 UdpProtocol::QueueEvent(const UdpProtocol::Event &evt)
 {
+   if (_event_queue.size() >= 63) {
+      Log("Event queue full (%d), dropping event\n", _event_queue.size());
+      return;
+   }
    LogEvent("Queuing event", evt);
    _event_queue.push(evt);
 }
@@ -442,7 +446,8 @@ UdpProtocol::LogMsg(const char *prefix, UdpMsg *msg)
       Log("%s input ack.\n", prefix);
       break;
    default:
-      ASSERT(FALSE && "Unknown UdpMsg type.");
+      Log("%s unknown msg type (%d).\n", prefix, msg->hdr.type);
+      break;
    }
 }
 
@@ -516,6 +521,18 @@ UdpProtocol::OnSyncReply(UdpMsg *msg, int len)
 bool
 UdpProtocol::OnInput(UdpMsg *msg, int len)
 {
+   const int hdr_size = static_cast<int>((reinterpret_cast<const uint8*>(msg->u.input.bits)) - reinterpret_cast<const uint8*>(msg));
+   if (len < hdr_size) {
+      return false;
+   }
+   if (msg->u.input.input_size > sizeof(_last_received_input.bits)) {
+      return false;
+   }
+   const int avail_bytes = len - hdr_size;
+   if (msg->u.input.num_bits > avail_bytes * 8 || msg->u.input.num_bits > MAX_COMPRESSED_BITS) {
+      return false;
+   }
+
    /*
     * If a disconnect is requested, go ahead and disconnect now.
     */
@@ -533,7 +550,6 @@ UdpProtocol::OnInput(UdpMsg *msg, int len)
        */
       UdpMsg::connect_status* remote_status = msg->u.input.peer_connect_status;
       for (int i = 0; i < ARRAY_SIZE(_peer_connect_status); i++) {
-         ASSERT(remote_status[i].last_frame >= _peer_connect_status[i].last_frame);
          _peer_connect_status[i].disconnected = _peer_connect_status[i].disconnected || remote_status[i].disconnected;
          _peer_connect_status[i].last_frame = MAX(_peer_connect_status[i].last_frame, remote_status[i].last_frame);
       }
@@ -558,12 +574,17 @@ UdpProtocol::OnInput(UdpMsg *msg, int len)
           * Keep walking through the frames (parsing bits) until we reach
           * the inputs for the frame right after the one we're on.
           */
-         ASSERT(currentFrame <= (_last_received_input.frame + 1));
+         if (currentFrame > (_last_received_input.frame + 1)) {
+            return false;
+         }
          bool useInputs = currentFrame == _last_received_input.frame + 1;
 
          while (BitVector_ReadBit(bits, &offset)) {
             int on = BitVector_ReadBit(bits, &offset);
             int button = BitVector_ReadNibblet(bits, &offset);
+            if (button < 0 || button >= static_cast<int>(sizeof(_last_received_input.bits) * 8)) {
+               return false;
+            }
             if (useInputs) {
                if (on) {
                   _last_received_input.set(button);
@@ -572,7 +593,9 @@ UdpProtocol::OnInput(UdpMsg *msg, int len)
                }
             }
          }
-         ASSERT(offset <= numBits);
+         if (offset > numBits) {
+            return false;
+         }
 
          /*
           * Now if we want to use these inputs, go ahead and send them to
@@ -583,7 +606,9 @@ UdpProtocol::OnInput(UdpMsg *msg, int len)
              * Move forward 1 frame in the stream.
              */
             char desc[1024];
-            ASSERT(currentFrame == _last_received_input.frame + 1);
+            if (currentFrame != _last_received_input.frame + 1) {
+               return false;
+            }
             _last_received_input.frame = currentFrame;
 
             /*
@@ -609,7 +634,9 @@ UdpProtocol::OnInput(UdpMsg *msg, int len)
          currentFrame++;
       }
    }
-   ASSERT(_last_received_input.frame >= last_received_frame_number);
+   if (_last_received_input.frame < last_received_frame_number) {
+      return false;
+   }
 
    /*
     * Get rid of our buffered input
