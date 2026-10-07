@@ -12,6 +12,7 @@
 #include "overlay.h"
 
 #include <share.h>
+#include <io.h>
 
 #include <cstdio>
 #include <algorithm>
@@ -1488,11 +1489,17 @@ bool CloudName(const char* name, std::string& path) {
 bool __fastcall CloudFileWrite(void*, void*, const char* name, const void* data, int size) {
 	std::string path;
 	if (!CloudName(name, path) || size < 0) return false;
+
+	const std::string tmp = path + ".tmp";
 	FILE* f = nullptr;
-	if (fopen_s(&f, path.c_str(), "wb") != 0 || !f) { Log("CLOUD: write %s FAILED", name); return false; }
-	const bool ok = fwrite(data, 1, static_cast<size_t>(size), f) == static_cast<size_t>(size);
-	fclose(f);
-	Log("CLOUD: write %s, %d bytes%s", name, size, ok ? "" : " FAILED");
+	if (fopen_s(&f, tmp.c_str(), "wb") != 0 || !f) { Log("CLOUD: write %s FAILED", name); return false; }
+	bool ok = fwrite(data, 1, static_cast<size_t>(size), f) == static_cast<size_t>(size);
+	ok = (fflush(f) == 0) && ok;
+	ok = (_commit(_fileno(f)) == 0) && ok;
+	ok = (fclose(f) == 0) && ok;
+	ok = ok && MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+	if (!ok) DeleteFileA(tmp.c_str());
+	Log("CLOUD: write %s, %d bytes%s", name, size, ok ? "" : " FAILED (old profile kept)");
 	return ok;
 }
 int __fastcall CloudFileRead(void*, void*, const char* name, void* data, int cap) {
