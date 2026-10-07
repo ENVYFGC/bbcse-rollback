@@ -29,7 +29,7 @@ cl /nologo /std:c++17 /EHsc /O2 /W3 /MT /LD /D_WINDOWS /D_CRT_SECURE_NO_WARNINGS
    "%I%\imgui.cpp" "%I%\imgui_draw.cpp" "%I%\imgui_tables.cpp" "%I%\imgui_widgets.cpp" ^
    "%I%\imgui_impl_dx9.cpp" "%I%\imgui_impl_win32.cpp" ^
    /Fe:dinput8.dll ^
-   /link /DEF:"%~dp0src\exports.def" /IMPLIB:proxy.lib /MACHINE:X86 dinput8.lib dxguid.lib user32.lib ws2_32.lib winmm.lib dwmapi.lib imm32.lib
+   /link /DEF:"%~dp0src\exports.def" /IMPLIB:proxy.lib /MACHINE:X86 dinput8.lib dxguid.lib user32.lib ws2_32.lib winmm.lib dwmapi.lib imm32.lib advapi32.lib
 set RC=%errorlevel%
 popd
 if %RC% neq 0 ( echo [FAIL] build failed rc=%RC% & exit /b %RC% )

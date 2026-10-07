@@ -11,6 +11,7 @@ To make rollback possible, the mod saves and restores the battle state every fra
 Other things it fixes along the way:
 
 - the Network menu not opening anymore.
+- your online profile (D-Card) getting lost and the game asking you to make a new one at every online login. Steam Cloud isn't enabled for the game anymore, so the mod keeps `DCARD.UMS` in a `bbcse-cloud` folder next to the game instead. If you have your old one backed up on Steam Cloud, download it from Steam's cloud page and drop it in that folder
 - the uneven frame rate on plain Direct3D 9 (30 fps or bouncing between 60 and 58). The mod paces the game at a steady 60 itself, and if your driver forces VSync it lets VSync handle it instead of fighting it
 
 ## Install
