@@ -4,7 +4,7 @@ Rollback netcode for **BlazBlue: Continuum Shift Extend** on Steam.
 
 ## What it does
 
-You still play online the normal way: Network menu, lobbies, player matches, all of it is the game's own. Once a fight starts, the mod takes over the input exchange and runs it through [GGPO](https://github.com/pond3r/ggpo) over the same Steam connection the game already uses. Spectating and replays are left to the game.
+You still play online the normal way: Network menu, lobbies, player matches, all of it is the game's own. Once a fight starts, the mod takes over the input exchange and runs it through [GGPO](https://github.com/pond3r/ggpo) over the same Steam connection the game already uses. Spectating and replays are left to the game (the mod feeds the replay recorder the real inputs, so replays of rollback matches play back properly).
 
 To make rollback possible, the mod saves and restores the battle state every frame (characters, objects, effects, camera, RNG, stage and UI bits). Both sides also compare a state hash during the match, so if the games ever split it shows up in the log right away.
 
