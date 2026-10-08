@@ -2130,9 +2130,7 @@ void DesyncDump(int frame, DWORD mine, DWORD theirs) {
 	GetModuleFileNameA(GetModuleHandleA("dinput8.dll"), path, MAX_PATH);
 	char* slash = strrchr(path, '\\');
 	*(slash ? slash + 1 : path) = 0;
-	char name[64];
-	sprintf_s(name, "bbcse-desync-%d.bin", frame);
-	strcat_s(path, name);
+	strcat_s(path, "bbcse-desync.bin");
 	FILE* f = nullptr;
 	if (fopen_s(&f, path, "wb") != 0 || !f) { Log("  could not write %s", path); return; }
 	const DWORD hdr[3] = {0x53444242 , static_cast<DWORD>(frame), static_cast<DWORD>(g_net.side)};
@@ -2732,7 +2730,7 @@ LONG CALLBACK CrashCapture(EXCEPTION_POINTERS* ep) {
 
 void InstallCrashCapture(HMODULE self) {
 	g_crashDir = ModuleDir(self);
-	AddVectoredExceptionHandler(1, CrashCapture);
+	AddVectoredExceptionHandler(0, CrashCapture);
 	Log("crash capture on (C++ exceptions and faults -> log, bbcse-crash.txt, bbcse-crash.dmp)");
 }
 
