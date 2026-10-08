@@ -60,8 +60,7 @@ static void Draw() {
 	Row("VSync", "%s", s.vsyncOff ? "off (game limiter, 60 fps)" : "on");
 	ImGui::Separator();
 	if (s.desyncFrame >= 0)
-		ImGui::TextColored(ImVec4(1, 0.35f, 0.35f, 1), "DESYNC at frame %d (state saved to bbcse-desync-%d.bin)", s.desyncFrame,
-		                   s.desyncFrame);
+		ImGui::TextColored(ImVec4(1, 0.35f, 0.35f, 1), "DESYNC at frame %d (state saved to bbcse-desync.bin)", s.desyncFrame);
 	else
 		ImGui::TextColored(ImVec4(0.45f, 1, 0.45f, 1), "In sync (%d checks matched)", s.syncChecks);
 	ImGui::End();

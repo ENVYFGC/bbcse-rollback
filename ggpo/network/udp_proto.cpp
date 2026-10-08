@@ -390,6 +390,10 @@ UdpProtocol::UpdateNetworkStats(void)
 void
 UdpProtocol::QueueEvent(const UdpProtocol::Event &evt)
 {
+   if (_event_queue.size() >= 63) {
+      Log("Event queue full (%d), dropping event\n", _event_queue.size());
+      return;
+   }
    LogEvent("Queuing event", evt);
    _event_queue.push(evt);
 }
