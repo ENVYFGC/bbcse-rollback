@@ -7,6 +7,7 @@
 #include <windows.h>
 #include <intrin.h>
 #include <dinput.h>
+#include <d3d9.h>
 
 #include "ggponet.h"
 #include "overlay.h"
@@ -1118,7 +1119,7 @@ constexpr DWORD kSceneStateOff = 0x2C, kRoundEndFlag = 0xBCE9F0;
 constexpr int kSceneFighting = 8;
 void* g_sceneForSlots = nullptr;
 
-constexpr DWORD kRecorder = 0x1395378, kRecTotalOff = 0x585E8, kRecRoundOff = 0x585EC, kRecRoundBlock = 0x8D10,
+constexpr DWORD kRecorder = 0x1395370, kRecTotalOff = 0x585E8, kRecRoundOff = 0x585EC, kRecRoundBlock = 0x8D10,
                 kRecRoundCountOff = 0x300;
 void SaveSceneFields(Slot& s) {
 	{
@@ -1331,11 +1332,61 @@ bool PatchVtableSlot(void* obj, int slot, void* hook, void** orig) {
 	return true;
 }
 
+bool g_borderless = false;
+HWND g_borderlessWnd = nullptr;
+RECT g_borderlessRect{};
+
+constexpr DWORD kIatSetWindowPos = 0x90425C, kIatSetWindowLongA = 0x904298;
+constexpr LONG kFrameStyles = WS_OVERLAPPEDWINDOW;
+using SetWindowPos_t = BOOL(WINAPI*)(HWND, HWND, int, int, int, int, UINT);
+using SetWindowLongA_t = LONG(WINAPI*)(HWND, int, LONG);
+SetWindowPos_t g_origSetWindowPos = nullptr;
+SetWindowLongA_t g_origSetWindowLongA = nullptr;
+LONG WINAPI HookSetWindowLongA(HWND w, int i, LONG v) {
+	if (w && w == g_borderlessWnd && i == GWL_STYLE) v = (v & ~kFrameStyles) | WS_POPUP;
+	return g_origSetWindowLongA(w, i, v);
+}
+BOOL WINAPI HookSetWindowPos(HWND w, HWND after, int x, int y, int cx, int cy, UINT flags) {
+	if (w && w == g_borderlessWnd) {
+		const RECT& r = g_borderlessRect;
+		x = r.left; y = r.top; cx = r.right - r.left; cy = r.bottom - r.top;
+		flags &= ~(SWP_NOMOVE | SWP_NOSIZE);
+	}
+	return g_origSetWindowPos(w, after, x, y, cx, cy, flags);
+}
+void PatchIat(DWORD slotVa, void* hook, void** orig) {
+	void** slot = reinterpret_cast<void**>(reinterpret_cast<BYTE*>(GetModuleHandleA(nullptr)) + (slotVa - kImage));
+	if (*slot == hook) return;
+	DWORD old;
+	if (!VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &old)) return;
+	*orig = *slot;
+	*slot = hook;
+	VirtualProtect(slot, sizeof(void*), old, &old);
+}
+void MakeBorderless(void* pp) {
+	if (!g_borderless || !pp) return;
+	const auto* p = static_cast<const D3DPRESENT_PARAMETERS*>(pp);
+	if (!p->Windowed || !p->hDeviceWindow) return;
+	const HWND w = p->hDeviceWindow;
+	MONITORINFO mi{sizeof(mi)};
+	if (!GetMonitorInfoA(MonitorFromWindow(w, MONITOR_DEFAULTTOPRIMARY), &mi)) return;
+	const RECT& r = mi.rcMonitor;
+	g_borderlessWnd = w;
+	g_borderlessRect = r;
+	if (!g_origSetWindowPos) {
+		PatchIat(kIatSetWindowPos, reinterpret_cast<void*>(&HookSetWindowPos), reinterpret_cast<void**>(&g_origSetWindowPos));
+		PatchIat(kIatSetWindowLongA, reinterpret_cast<void*>(&HookSetWindowLongA), reinterpret_cast<void**>(&g_origSetWindowLongA));
+	}
+	SetWindowLongA(w, GWL_STYLE, (GetWindowLongA(w, GWL_STYLE) & ~WS_OVERLAPPEDWINDOW) | WS_POPUP | WS_VISIBLE);
+	SetWindowPos(w, HWND_TOP, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+	static bool logged = false;
+	if (!logged) { logged = true; Log("DISPLAY: borderless window %ldx%ld (back buffer %ux%u)", r.right - r.left, r.bottom - r.top, p->BackBufferWidth, p->BackBufferHeight); }
+}
 HRESULT __stdcall HookReset(void* dev, void* pp) {
 	if (g_vsyncWanted) ForceImmediate(pp, "Reset");
 	Overlay_BeforeReset();
 	const HRESULT hr = g_origReset(dev, pp);
-	if (hr >= 0) Overlay_AfterReset();
+	if (hr >= 0) { Overlay_AfterReset(); MakeBorderless(pp); }
 	return hr;
 }
 
@@ -1448,6 +1499,52 @@ HRESULT __stdcall HookPresent(void* dev, const void* src, const void* dst, HWND 
 	}
 	return hr;
 }
+
+int g_renderW = 0, g_renderH = 0;
+using CreateRT_t = HRESULT(__stdcall*)(void* dev, UINT w, UINT h, DWORD fmt, DWORD ms, DWORD q, BOOL flag, void** surf, HANDLE* share);
+using SetViewport_t = HRESULT(__stdcall*)(void* dev, const D3DVIEWPORT9* vp);
+using StretchRect_t = HRESULT(__stdcall*)(void* dev, void* src, const RECT* srcRect, void* dst, const RECT* dstRect, DWORD filter);
+CreateRT_t g_origCreateRT = nullptr, g_origCreateDS = nullptr;
+SetViewport_t g_origSetViewport = nullptr;
+StretchRect_t g_origStretchRect = nullptr;
+bool IsCanvasSize(UINT w, UINT h) { return w == 1280 && h == 768; }
+HRESULT __stdcall HookCreateRT(void* dev, UINT w, UINT h, DWORD fmt, DWORD ms, DWORD q, BOOL lockable, void** surf, HANDLE* share) {
+	if (IsCanvasSize(w, h)) { w = g_renderW; h = g_renderH; Log("DISPLAY: game canvas drawn at %ux%u", w, h); }
+	return g_origCreateRT(dev, w, h, fmt, ms, q, lockable, surf, share);
+}
+HRESULT __stdcall HookCreateDS(void* dev, UINT w, UINT h, DWORD fmt, DWORD ms, DWORD q, BOOL discard, void** surf, HANDLE* share) {
+	if (IsCanvasSize(w, h)) { w = g_renderW; h = g_renderH; }
+	return g_origCreateDS(dev, w, h, fmt, ms, q, discard, surf, share);
+}
+
+bool IsRenderSized(IDirect3DSurface9* surf) {
+	D3DSURFACE_DESC d{};
+	return surf && SUCCEEDED(surf->GetDesc(&d)) && d.Width == static_cast<UINT>(g_renderW) && d.Height == static_cast<UINT>(g_renderH);
+}
+bool TargetIsRenderSized(void* dev) {
+	IDirect3DSurface9* rt = nullptr;
+	if (FAILED(static_cast<IDirect3DDevice9*>(dev)->GetRenderTarget(0, &rt)) || !rt) return false;
+	const bool yes = IsRenderSized(rt);
+	rt->Release();
+	return yes;
+}
+HRESULT __stdcall HookSetViewport(void* dev, const D3DVIEWPORT9* vp) {
+	if (vp && vp->X == 0 && vp->Y == 0 && IsCanvasSize(vp->Width, vp->Height) && TargetIsRenderSized(dev)) {
+		D3DVIEWPORT9 v = *vp;
+		v.Width = g_renderW;
+		v.Height = g_renderH;
+		return g_origSetViewport(dev, &v);
+	}
+	return g_origSetViewport(dev, vp);
+}
+HRESULT __stdcall HookStretchRect(void* dev, void* src, const RECT* srcRect, void* dst, const RECT* dstRect, DWORD filter) {
+	if (srcRect && srcRect->left == 0 && srcRect->top == 0 && IsCanvasSize(srcRect->right, srcRect->bottom) &&
+	    IsRenderSized(static_cast<IDirect3DSurface9*>(src))) {
+		const RECT r = {0, 0, g_renderW, g_renderH};
+		return g_origStretchRect(dev, src, &r, dst, dstRect, D3DTEXF_LINEAR);
+	}
+	return g_origStretchRect(dev, src, srcRect, dst, dstRect, filter);
+}
 void InstallDeviceHooks(void* dev) {
 	if (!dev || g_origPresent) return;
 
@@ -1459,12 +1556,20 @@ void InstallDeviceHooks(void* dev) {
 	}
 	PatchVtableSlot(dev, 16, reinterpret_cast<void*>(&HookReset), reinterpret_cast<void**>(&g_origReset));
 	PatchVtableSlot(dev, 17, reinterpret_cast<void*>(&HookPresent), reinterpret_cast<void**>(&g_origPresent));
+	if (g_renderW > 0 && g_renderH > 0) {
+		PatchVtableSlot(dev, 28, reinterpret_cast<void*>(&HookCreateRT), reinterpret_cast<void**>(&g_origCreateRT));
+		PatchVtableSlot(dev, 29, reinterpret_cast<void*>(&HookCreateDS), reinterpret_cast<void**>(&g_origCreateDS));
+		PatchVtableSlot(dev, 34, reinterpret_cast<void*>(&HookStretchRect), reinterpret_cast<void**>(&g_origStretchRect));
+		PatchVtableSlot(dev, 47, reinterpret_cast<void*>(&HookSetViewport), reinterpret_cast<void**>(&g_origSetViewport));
+		Log("DISPLAY: render size %dx%d (game default 1280x768)", g_renderW, g_renderH);
+	}
 	Log("overlay: device hooks installed (F1 shows / hides the diagnostics panel in online battles)");
 }
 HRESULT __stdcall HookCreateDevice(void* d3d, UINT adapter, DWORD type, HWND wnd, DWORD flags, void* pp, void** dev) {
 	if (g_vsyncWanted) ForceImmediate(pp, "CreateDevice");
 	const HRESULT hr = g_origCreateDevice(d3d, adapter, type, wnd, flags, pp, dev);
 	if (hr >= 0 && dev && *dev) InstallDeviceHooks(*dev);
+	if (hr >= 0) MakeBorderless(pp);
 	return hr;
 }
 void* WINAPI HookD3DCreate(UINT sdk) {
@@ -1612,6 +1717,10 @@ void InstallVsyncOff(HMODULE self) {
 	GetPrivateProfileStringA("net", "mode", "", mode, sizeof(mode), ini.c_str());
 	if (_stricmp(mode, "steam") != 0 || GetPrivateProfileIntA("net", "vsync", 0, ini.c_str()) != 0) return;
 	g_vsyncWanted = true;
+	g_renderW = GetPrivateProfileIntA("display", "renderwidth", 0, ini.c_str());
+	g_renderH = GetPrivateProfileIntA("display", "renderheight", 0, ini.c_str());
+	g_borderless = GetPrivateProfileIntA("display", "borderless", 0, ini.c_str()) != 0;
+	if (g_renderW < 320 || g_renderH < 192 || g_renderW > 8192 || g_renderH > 8192) g_renderW = g_renderH = 0;
 	BYTE* base = reinterpret_cast<BYTE*>(GetModuleHandleA(nullptr));
 	void** slot = reinterpret_cast<void**>(base + (kD3DCreateIat - kImage));
 	HMODULE d3d9 = GetModuleHandleA("d3d9.dll");
@@ -1699,6 +1808,13 @@ struct NetState {
 	void* scene = nullptr;
 } g_net;
 bool g_netActive = false;
+
+bool g_spectating = false;
+LONG g_specRngFixes = 0;
+int g_specBase = 0, g_specRound = -1, g_specIdx = -1;
+void SpectatorSync();
+void ReplaySync();
+int g_replayFrame = 0;
 DWORD g_netIn[2];
 bool g_netInUpdate = false;
 
@@ -1840,10 +1956,18 @@ bool __cdecl NetSave(unsigned char** buf, int* len, int* checksum, int frame) {
 	*checksum = NetChecksum();
 	return true;
 }
+
+int g_rbFromFrame = -1, g_rbShownHash = 0, g_rbDepth = 0;
+LONG g_rbCount = 0, g_rbChanged = 0, g_rbChangedDepthMax = 0, g_rbChangedDepthSum = 0;
 bool __cdecl NetLoad(unsigned char* buf, int) {
 	struct Add { double t0; ~Add() { g_msLoad += NowMs() - t0; } } add{NowMs()};
 	if (!buf) { Log("NET: load of an empty state (save had failed). Desync likely."); return false; }
 	const Slot* s = reinterpret_cast<const Slot*>(buf);
+	if (g_rbFromFrame < 0 && s->frame < g_net.frame) {
+		g_rbFromFrame = g_net.frame;
+		g_rbDepth = g_net.frame - s->frame;
+		g_rbShownHash = NetChecksum();
+	}
 	if (!LoadSlot(*s)) { Log("NET: load FAILED (frame %ld): regions moved. Desync likely.", s->frame); return false; }
 	g_net.frame = s->frame;
 	return true;
@@ -1875,6 +1999,15 @@ bool __cdecl NetAdvance(int) {
 	++g_net.frame;
 	MarkSyncFrame();
 	++g_netRollbackFrames;
+	if (g_rbFromFrame >= 0 && g_net.frame >= g_rbFromFrame) {
+		++g_rbCount;
+		if (NetChecksum() != g_rbShownHash) {
+			++g_rbChanged;
+			g_rbChangedDepthSum += g_rbDepth;
+			if (g_rbDepth > g_rbChangedDepthMax) g_rbChangedDepthMax = g_rbDepth;
+		}
+		g_rbFromFrame = -1;
+	}
 	ggpo_advance_frame(g_net.session);
 	return true;
 }
@@ -1960,6 +2093,32 @@ void* __fastcall HookNetWait(void* self, void* edx, int arg) {
 	return self;
 }
 
+void AskForMissingInputs() {
+	static WORD lastCount[2] = {0xFFFF, 0xFFFF};
+	static int stale[2] = {};
+	static unsigned lastRound = 0xFF;
+	static int sinceRoundChange = 0;
+	BYTE* ses = Live(kNetSession);
+	const unsigned cur = ses[0x11AAA] & 1;
+	if (cur != lastRound) { lastRound = cur; sinceRoundChange = 0; }
+	else ++sinceRoundChange;
+	const int opp = 1 - g_net.side;
+	for (const unsigned r : {cur, cur ^ 1u}) {
+		WORD* counts = reinterpret_cast<WORD*>(ses + 0x160 + (36000 + r * 2) * 2);
+		const WORD count = counts[opp];
+		if (r != cur && (sinceRoundChange > 600 || count >= counts[g_net.side])) continue;
+		if (count != lastCount[r]) { lastCount[r] = count; stale[r] = 0; continue; }
+		if (++stale[r] % 30) continue;
+		const BYTE direct = ses[0x11D05];
+		BYTE* to = *reinterpret_cast<BYTE**>(ses + ((direct & 0x20) && (direct & 0x40) ? 0x12048 + 4 * opp : 0x12044));
+		if (!to) return;
+		WORD msg[5] = {10, 0x2B, count, static_cast<WORD>(opp), ses[0x11AA8 + r]};
+		using Queue_t = int(__fastcall*)(void* net, void* edx, WORD* msg, void* addr);
+		using GetNet_t = void*(__cdecl*)();
+		reinterpret_cast<Queue_t>(Live(0x404140))(reinterpret_cast<GetNet_t>(Live(0x4044F0))(), nullptr, msg, to + 0x70);
+	}
+}
+
 int AppliedInputWord(int side) {
 	BYTE* gm = Live(kGameMgr);
 	const int slot = *reinterpret_cast<int*>(gm + kSideSlotOff + 4 * side);
@@ -1967,14 +2126,29 @@ int AppliedInputWord(int side) {
 	using ToWord_t = unsigned short(__fastcall*)(void* gm, void* edx, int slot, unsigned mask, int flip);
 	return reinterpret_cast<ToWord_t>(Live(0x456050))(gm, nullptr, slot, g_netIn[side], 0);
 }
+void* g_netSendSelf = nullptr;
 int __fastcall HookNetSend(void* self, void* edx, unsigned side, unsigned input) {
+	g_netSendSelf = self;
+
 	if (SteamMode() && !g_netRealAdvance) return 1;
 
 	if (SteamMode() && side < 2) {
 		const int word = AppliedInputWord(static_cast<int>(side));
 		if (word >= 0) input = static_cast<unsigned>(word);
+
+		BYTE* ses = Live(kNetSession);
+		WORD* count = reinterpret_cast<WORD*>(ses + 0x160 + (side + 36000 + ses[0x11AAA] * 2u) * 2);
+		const WORD index = *reinterpret_cast<WORD*>(ses + 0x11AB2);
+
+		if (static_cast<int>(side) == g_net.side && *count != index) {
+			static int logged = 0;
+			if (logged++ < 4) Log("NET: input slot %u realigned to frame index %u (side %u)", *count, index, side);
+			*count = index;
+		}
 	}
-	return g_origNetSend(self, edx, side, input);
+	const int sent = g_origNetSend(self, edx, side, input);
+	if (SteamMode() && static_cast<int>(side) == g_net.side) AskForMissingInputs();
+	return sent;
 }
 
 constexpr DWORD kNetIndexSite = 0x56F75E, kNetIndexFn = 0x45F9B0;
@@ -1983,6 +2157,43 @@ NetIndex_t g_origNetIndex = nullptr;
 void __fastcall HookNetIndex(void* netstate, void* edx) {
 	if (SteamMode() && !g_netRealAdvance) return;
 	g_origNetIndex(netstate, edx);
+}
+
+constexpr DWORD kNetInputMsgSite = 0x4691A3, kNetInputMsgFn = 0x45FF50;
+constexpr DWORD kNetRelayMsgSite = 0x4691E0, kNetRelayMsgFn = 0x4603E0;
+using NetMsg_t = void(__fastcall*)(void* self, void* edx, void* msg, void* ctx);
+NetMsg_t g_origNetInputMsg = nullptr;
+NetMsg_t g_origNetRelayMsg = nullptr;
+
+DWORD g_netInputGraceUntil = 0;
+void __fastcall HookNetInputMsg(void* self, void* edx, void* msg, void* ctx) {
+	if (!SteamMode() && static_cast<LONG>(GetTickCount() - g_netInputGraceUntil) > 0)
+		return g_origNetInputMsg(self, edx, msg, ctx);
+	BYTE* ses = Live(kNetSession);
+	const BYTE tag = static_cast<const BYTE*>(msg)[6];
+	const BYTE round = ses[0x11AAA];
+	const unsigned cur = round & 1;
+	const bool previous = tag != ses[0x11AA8 + cur] && tag == ses[0x11AA8 + (cur ^ 1)];
+	WORD* idx = reinterpret_cast<WORD*>(ses + 0x11AB2);
+	const WORD keep = *idx;
+	*idx = 0;
+	if (previous) ses[0x11AAA] = static_cast<BYTE>(cur ^ 1);
+	g_origNetInputMsg(self, edx, msg, ctx);
+	ses[0x11AAA] = round;
+	*idx = keep;
+}
+void __fastcall HookNetRelayMsg(void* self, void* edx, void* msg, void* ctx) {
+	if (!SteamMode()) return g_origNetRelayMsg(self, edx, msg, ctx);
+	WORD* count = reinterpret_cast<WORD*>(Live(kNetSession) + 0x160 + 36000 * 2);
+	WORD keep[4];
+	for (int r = 0; r < 2; ++r) {
+		keep[r * 2] = count[r * 2];
+		keep[r * 2 + 1] = count[r * 2 + 1];
+		const WORD both = (std::min)(count[r * 2], count[r * 2 + 1]);
+		count[r * 2] = count[r * 2 + 1] = both;
+	}
+	g_origNetRelayMsg(self, edx, msg, ctx);
+	for (int i = 0; i < 4; ++i) count[i] = keep[i];
 }
 
 void LogNetCounters(const char* who) {
@@ -2014,7 +2225,7 @@ bool StartSteamSession(GGPOSessionCallbacks& cb, int delay) {
 	BYTE* self = *reinterpret_cast<BYTE**>(Live(kNetSession) + 0x12040);
 	if (!self) return false;
 	const WORD flags = *reinterpret_cast<WORD*>(self + 0x5A);
-	if (!(flags & 0x10)) { Log("NET: spectating; rollback off"); return false; }
+	if (!(flags & 0x10)) { g_spectating = true; Log("NET: spectating; rollback off"); return false; }
 	g_net.side = flags & 1;
 	BYTE* peer = NetPeer(1 - g_net.side);
 	if (!peer) { Log("NET: no opponent object; rollback off"); return false; }
@@ -2081,7 +2292,7 @@ BYTE* Rng1() {
 }
 void __cdecl HookDrawBegin() {
 	BYTE* r = Rng1();
-	g_rngDrawSaved = g_netActive && r;
+	g_rngDrawSaved = (g_netActive || (g_spectating && SceneFighting())) && r;
 	if (g_rngDrawSaved) memcpy(g_rngDrawCopy, r, kRngSize);
 	g_origDrawBegin();
 }
@@ -2092,6 +2303,7 @@ bool __fastcall HookRoundCheck(void* flags) {
 		if (r && memcmp(r, g_rngDrawCopy, kRngSize) != 0) {
 			memcpy(r, g_rngDrawCopy, kRngSize);
 			++g_rngDrawFixes;
+			if (g_spectating) ++g_specRngFixes;
 		}
 	}
 	return g_origRoundCheck(flags);
@@ -2106,6 +2318,7 @@ void RngCheckBetweenTicks() {
 	if (r && g_rngAfterValid && memcmp(r, g_rngAfterTick, kRngSize) != 0) {
 		memcpy(r, g_rngAfterTick, kRngSize);
 		++g_rngOutsideFixes;
+		if (g_spectating) ++g_specRngFixes;
 	}
 }
 
@@ -2198,11 +2411,16 @@ void NetStop() {
 	ggpo_bb_send = nullptr;
 	ggpo_bb_recv = nullptr;
 	g_netActive = false;
+	g_netInputGraceUntil = GetTickCount() + 10000;
 	Log("NET: session closed");
 }
 
 void NetBattleStart() {
 	NetStop();
+	g_spectating = false;
+	g_replayFrame = 0;
+	g_specBase = 0;
+	g_specRound = g_specIdx = -1;
 	g_steamRearm = false;
 	char ini[MAX_PATH];
 	GetModuleFileNameA(GetModuleHandleA("dinput8.dll"), ini, MAX_PATH);
@@ -2291,6 +2509,16 @@ void NetBarrier() {
 	RngMarkTick();
 }
 
+void PadMatchEndInputs() {
+	if (!g_netSendSelf || g_net.side < 0) return;
+	BYTE* ses = Live(kNetSession);
+	const WORD count = *reinterpret_cast<WORD*>(ses + 0x160 + (g_net.side + 36000 + ses[0x11AAA] * 2u) * 2);
+	if (count + 30 >= 9000) return;
+	const int word = AppliedInputWord(g_net.side);
+	for (int i = 0; i < 30; ++i) g_origNetSend(g_netSendSelf, nullptr, g_net.side, word < 0 ? 0 : word);
+	Log("NET: match end: sent 30 spare input frames after %u", count);
+}
+
 void NetRoundEnd() {
 	const DWORD start = GetTickCount();
 	while (ggpo_get_confirmed_frame(g_net.session) < g_net.frame - 1 && GetTickCount() - start < 5000)
@@ -2304,6 +2532,7 @@ void NetRoundEnd() {
 		return;
 	}
 	const bool steam = g_net.steam;
+	if (steam) PadMatchEndInputs();
 	NetStop();
 	g_steamRearm = steam;
 }
@@ -2459,6 +2688,9 @@ void NetTick(void* self, void* edx, int arg) {
 			g_latCount ? static_cast<double>(g_latSum) / g_latCount : 0.0, g_latMax, g_latCount,
 			g_msSave, g_msLoad, g_msResim, g_holdPause, g_holdLimit, g_holdSync, g_holdConnect, g_netStalls,
 			g_paceRiftEma, g_paceAppliedMs, g_vsyncForcedOff ? "off" : "on");
+		Log("NET 1s: %ld rollbacks, %ld changed what was on screen (avg %.1f, max %ld frames deep)", g_rbCount, g_rbChanged,
+			g_rbChanged ? static_cast<double>(g_rbChangedDepthSum) / g_rbChanged : 0.0, g_rbChangedDepthMax);
+		g_rbCount = g_rbChanged = g_rbChangedDepthSum = g_rbChangedDepthMax = 0;
 		if (g_net.steam) LogNetCounters("player");
 		g_paceAppliedMs = 0;
 		g_msSave = g_msLoad = g_msResim = 0;
@@ -2601,7 +2833,14 @@ void __fastcall HookUpdateBattle(void* self, void* edx, int arg) {
 	const int before = P1FrameCounter();
 	g_holdSim = g_mode == 1;
 	g_realFrame = g_syncN ? g_syncFrame - 1 : -1;
+	const bool walled = g_spectating && SceneFighting();
+	if (walled) RngCheckBetweenTicks();
+	else g_rngAfterValid = false;
 	g_origUpdate(self, edx, arg);
+	if (walled && SceneFighting()) RngMarkTick();
+	else g_rngAfterValid = false;
+	if (walled) SpectatorSync();
+	if (*reinterpret_cast<int*>(Live(kGameMgr) + 8) == 8 && SceneFighting()) ReplaySync();
 	g_realFrame = -1;
 	g_holdSim = false;
 	++g_ticks;
@@ -2614,6 +2853,8 @@ void __fastcall HookUpdateBattle(void* self, void* edx, int arg) {
 		Log("1s: calls=%ld ticks=%ld skipped=%ld doubled=%ld  P1 frame %d -> %d  arg=%d mode=%d",
 			g_calls, g_ticks, g_skipped, g_doubled, before, P1FrameCounter(), arg, g_mode);
 		if (*reinterpret_cast<int*>(Live(kGameMgr) + 8) == 4) LogNetCounters("no rollback (spectating?)");
+		if (g_spectating && g_specRngFixes) Log("SPECTATE: RNG wall stepped in %ld times", g_specRngFixes);
+		g_specRngFixes = 0;
 		if (g_syncN) {
 			Log("   sync N=%d arg=%d: %ld tests, %ld fails, %ld barrier skips, avg %.2f ms, max %.2f ms per frame, %ld polls during replays",
 				g_syncN, g_resimArg, g_syncTests, g_syncFails, g_syncBarriers, g_syncTests ? g_syncMs / g_syncTests : 0.0,
@@ -2734,6 +2975,43 @@ void InstallCrashCapture(HMODULE self) {
 	Log("crash capture on (C++ exceptions and faults -> log, bbcse-crash.txt, bbcse-crash.dmp)");
 }
 
+constexpr DWORD kRoomCreateSlot = 0x9609F0;
+using RoomCreate_t = int(__fastcall*)(void* self, void* edx, BYTE* cfg);
+RoomCreate_t g_origRoomCreate = nullptr;
+int __fastcall HookRoomCreate(void* self, void* edx, BYTE* cfg) {
+	char hex[3 * 0x20 + 1] = {};
+	for (int i = 0; i < 0x20; ++i) sprintf_s(hex + 3 * i, 4, "%02X ", cfg[0x48 + i]);
+	Log("ROOM: create, Steam member limit %u, settings +0x48: %s", cfg[0x52], hex);
+	return g_origRoomCreate(self, edx, cfg);
+}
+
+void ReplaySync() {
+	const int f = g_replayFrame++;
+	const BYTE* chars = *reinterpret_cast<BYTE**>(Live(kObjMgr) + kCharsPtrOff);
+	Log("REPLAYSYNC frame %d hash %08lX hp %d %d", f, CrossPcHash(),
+		chars ? *reinterpret_cast<const int*>(chars + kHpOff) : -1,
+		chars ? *reinterpret_cast<const int*>(chars + 0x20140 + kHpOff) : -1);
+}
+
+void SpectatorSync() {
+	BYTE* ses = Live(kNetSession);
+	const int round = ses[0x11AAA];
+	const int idx = *reinterpret_cast<WORD*>(ses + 0x11AB2);
+	if (round != g_specRound) {
+		if (g_specRound >= 0 && g_specIdx > 0) g_specBase += g_specIdx + 1;
+		g_specRound = round;
+		g_specIdx = -1;
+	}
+	if (idx == g_specIdx) return;
+	g_specIdx = idx;
+	const int f = g_specBase + idx;
+	if ((f + 1) % kSyncEvery > 2) return;
+	const BYTE* chars = *reinterpret_cast<BYTE**>(Live(kObjMgr) + kCharsPtrOff);
+	Log("SPECSYNC frame %d (round index %d) hash %08lX hp %d %d", f, idx, CrossPcHash(),
+		chars ? *reinterpret_cast<const int*>(chars + kHpOff) : -1,
+		chars ? *reinterpret_cast<const int*>(chars + 0x20140 + kHpOff) : -1);
+}
+
 void InstallTickHook() {
 	static bool done = false;
 	if (done) return;
@@ -2753,6 +3031,15 @@ void InstallTickHook() {
 	g_origNetFetch = reinterpret_cast<NetFetch_t>(Live(kNetFetchFn));
 	g_origNetIndex = reinterpret_cast<NetIndex_t>(Live(kNetIndexFn));
 	g_origMatchMenu = reinterpret_cast<MatchMenu_t>(Live(kMatchMenuFn));
+	g_origNetInputMsg = reinterpret_cast<NetMsg_t>(Live(kNetInputMsgFn));
+	g_origNetRelayMsg = reinterpret_cast<NetMsg_t>(Live(kNetRelayMsgFn));
+	{
+		void** slot = reinterpret_cast<void**>(Live(kRoomCreateSlot));
+		if (*slot == Live(0x442550)) {
+			g_origRoomCreate = reinterpret_cast<RoomCreate_t>(*slot);
+			PatchCloudSlot(slot, 0, reinterpret_cast<void*>(&HookRoomCreate));
+		}
+	}
 
 	struct Patch { DWORD site, target; void* hook; };
 	const Patch patches[] = {
@@ -2768,6 +3055,8 @@ void InstallTickHook() {
 		{kLimiterSiteB, kLimiterFn, reinterpret_cast<void*>(&HookLimiter)},
 		{kRoundCheckSite, kRoundCheckFn, reinterpret_cast<void*>(&HookRoundCheck)},
 		{kNetSendSite, kNetSendFn, reinterpret_cast<void*>(&HookNetSend)},
+		{kNetInputMsgSite, kNetInputMsgFn, reinterpret_cast<void*>(&HookNetInputMsg)},
+		{kNetRelayMsgSite, kNetRelayMsgFn, reinterpret_cast<void*>(&HookNetRelayMsg)},
 		{kNetFetchSite, kNetFetchFn, reinterpret_cast<void*>(&HookNetFetch)},
 		{kNetIndexSite, kNetIndexFn, reinterpret_cast<void*>(&HookNetIndex)},
 		{kMatchMenuSite, kMatchMenuFn, reinterpret_cast<void*>(&HookMatchMenu)},
@@ -2815,6 +3104,102 @@ void InstallTickHook() {
 	InstallDeviceHooks(*reinterpret_cast<void**>(Live(0xB8C800 + 0x2C)));
 }
 
+struct KeyName { const char* name; BYTE dik; };
+const KeyName kKeyNames[] = {
+	{"A", DIK_A}, {"B", DIK_B}, {"C", DIK_C}, {"D", DIK_D}, {"E", DIK_E}, {"F", DIK_F}, {"G", DIK_G},
+	{"H", DIK_H}, {"I", DIK_I}, {"J", DIK_J}, {"K", DIK_K}, {"L", DIK_L}, {"M", DIK_M}, {"N", DIK_N},
+	{"O", DIK_O}, {"P", DIK_P}, {"Q", DIK_Q}, {"R", DIK_R}, {"S", DIK_S}, {"T", DIK_T}, {"U", DIK_U},
+	{"V", DIK_V}, {"W", DIK_W}, {"X", DIK_X}, {"Y", DIK_Y}, {"Z", DIK_Z},
+	{"0", DIK_0}, {"1", DIK_1}, {"2", DIK_2}, {"3", DIK_3}, {"4", DIK_4}, {"5", DIK_5}, {"6", DIK_6},
+	{"7", DIK_7}, {"8", DIK_8}, {"9", DIK_9},
+	{"apostrophe", DIK_APOSTROPHE}, {"semicolon", DIK_SEMICOLON}, {"comma", DIK_COMMA},
+	{"period", DIK_PERIOD}, {"slash", DIK_SLASH}, {"backslash", DIK_BACKSLASH}, {"grave", DIK_GRAVE},
+	{"minus", DIK_MINUS}, {"equals", DIK_EQUALS}, {"lbracket", DIK_LBRACKET}, {"rbracket", DIK_RBRACKET},
+	{"space", DIK_SPACE}, {"tab", DIK_TAB}, {"capslock", DIK_CAPITAL}, {"enter", DIK_RETURN},
+	{"backspace", DIK_BACK}, {"lshift", DIK_LSHIFT}, {"rshift", DIK_RSHIFT}, {"lctrl", DIK_LCONTROL},
+	{"rctrl", DIK_RCONTROL}, {"lalt", DIK_LMENU}, {"ralt", DIK_RMENU}, {"up", DIK_UP}, {"down", DIK_DOWN},
+	{"left", DIK_LEFT}, {"right", DIK_RIGHT}, {"insert", DIK_INSERT}, {"delete", DIK_DELETE},
+	{"home", DIK_HOME}, {"end", DIK_END}, {"pageup", DIK_PRIOR}, {"pagedown", DIK_NEXT},
+	{"num0", DIK_NUMPAD0}, {"num1", DIK_NUMPAD1}, {"num2", DIK_NUMPAD2}, {"num3", DIK_NUMPAD3},
+	{"num4", DIK_NUMPAD4}, {"num5", DIK_NUMPAD5}, {"num6", DIK_NUMPAD6}, {"num7", DIK_NUMPAD7},
+	{"num8", DIK_NUMPAD8}, {"num9", DIK_NUMPAD9},
+};
+int KeyCode(const char* s) {
+	for (const auto& k : kKeyNames)
+		if (_stricmp(s, k.name) == 0) return k.dik;
+	char* end = nullptr;
+	const long v = strtol(s, &end, 0);
+	return *s && end && !*end && v > 0 && v < 256 ? static_cast<int>(v) : -1;
+}
+
+BYTE g_keyMap[256];
+bool g_keyRemap = false;
+void* g_keyboard = nullptr;
+using DiCreateDevice_t = HRESULT(__stdcall*)(void* di, REFGUID guid, void** dev, void* outer);
+using GetDeviceState_t = HRESULT(__stdcall*)(void* dev, DWORD size, void* data);
+using GetDeviceData_t = HRESULT(__stdcall*)(void* dev, DWORD objSize, DIDEVICEOBJECTDATA* data, DWORD* count, DWORD flags);
+DiCreateDevice_t g_origCreateInputDevice = nullptr;
+GetDeviceState_t g_origGetDeviceState = nullptr;
+GetDeviceData_t g_origGetDeviceData = nullptr;
+
+HRESULT __stdcall HookGetDeviceState(void* dev, DWORD size, void* data) {
+	const HRESULT hr = g_origGetDeviceState(dev, size, data);
+	if (SUCCEEDED(hr) && dev == g_keyboard && size == 256 && data) {
+		BYTE in[256], * out = static_cast<BYTE*>(data);
+		memcpy(in, out, 256);
+		memset(out, 0, 256);
+		for (int k = 0; k < 256; ++k) out[g_keyMap[k]] |= in[k];
+	}
+	return hr;
+}
+HRESULT __stdcall HookGetDeviceData(void* dev, DWORD objSize, DIDEVICEOBJECTDATA* data, DWORD* count, DWORD flags) {
+	const HRESULT hr = g_origGetDeviceData(dev, objSize, data, count, flags);
+	if (SUCCEEDED(hr) && dev == g_keyboard && data && count && objSize >= sizeof(DIDEVICEOBJECTDATA_DX3)) {
+		for (DWORD i = 0; i < *count; ++i) {
+			auto* e = reinterpret_cast<DIDEVICEOBJECTDATA*>(reinterpret_cast<BYTE*>(data) + i * objSize);
+			if (e->dwOfs < 256) e->dwOfs = g_keyMap[e->dwOfs];
+		}
+	}
+	return hr;
+}
+HRESULT __stdcall HookCreateInputDevice(void* di, REFGUID guid, void** dev, void* outer) {
+	const HRESULT hr = g_origCreateInputDevice(di, guid, dev, outer);
+	if (SUCCEEDED(hr) && dev && *dev && IsEqualGUID(guid, GUID_SysKeyboard)) {
+		g_keyboard = *dev;
+
+		PatchVtableSlot(*dev, 9, reinterpret_cast<void*>(&HookGetDeviceState), reinterpret_cast<void**>(&g_origGetDeviceState));
+		PatchVtableSlot(*dev, 10, reinterpret_cast<void*>(&HookGetDeviceData), reinterpret_cast<void**>(&g_origGetDeviceData));
+		Log("KEYS: keyboard remap active");
+	}
+	return hr;
+}
+void LoadKeyRemap() {
+	for (int k = 0; k < 256; ++k) g_keyMap[k] = static_cast<BYTE>(k);
+	char ini[MAX_PATH];
+	GetModuleFileNameA(GetModuleHandleA("dinput8.dll"), ini, MAX_PATH);
+	char* slash = strrchr(ini, '\\');
+	*(slash ? slash + 1 : ini) = 0;
+	strcat_s(ini, "bbcse-net.ini");
+	char sec[4096] = {};
+	GetPrivateProfileSectionA("keys", sec, sizeof(sec), ini);
+	for (char* p = sec; *p; p += strlen(p) + 1) {
+		char line[128];
+		strncpy_s(line, p, _TRUNCATE);
+		char* eq = strchr(line, '=');
+		if (!eq || line[0] == ';') continue;
+		*eq = 0;
+		auto trim = [](char* s) { while (*s == ' ' || *s == '\t') ++s; for (char* e = s + strlen(s); e > s && (e[-1] == ' ' || e[-1] == '\t'); ) *--e = 0; return s; };
+		char* from = trim(line);
+		char* to = trim(eq + 1);
+		if (char* c = strchr(to, ';')) { *c = 0; to = trim(to); }
+		const int a = KeyCode(from), b = KeyCode(to);
+		if (a < 0 || b < 0) { Log("KEYS: ignored '%s=%s' (unknown key name)", from, to); continue; }
+		g_keyMap[a] = static_cast<BYTE>(b);
+		g_keyRemap = true;
+		Log("KEYS: %s reads as %s", from, to);
+	}
+}
+
 }
 
 extern "C" HRESULT WINAPI DirectInput8Create(HINSTANCE inst, DWORD version, REFIID iid,
@@ -2826,7 +3211,12 @@ extern "C" HRESULT WINAPI DirectInput8Create(HINSTANCE inst, DWORD version, REFI
 			"bbcse-probe", MB_OK | MB_ICONERROR);
 		return E_FAIL;
 	}
-	return g_realCreate(inst, version, iid, out, outer);
+	const HRESULT hr = g_realCreate(inst, version, iid, out, outer);
+	static bool keysLoaded = false;
+	if (!keysLoaded) { keysLoaded = true; LoadKeyRemap(); }
+	if (SUCCEEDED(hr) && out && *out && g_keyRemap)
+		PatchVtableSlot(*out, 3, reinterpret_cast<void*>(&HookCreateInputDevice), reinterpret_cast<void**>(&g_origCreateInputDevice));
+	return hr;
 }
 
 extern "C" void __cdecl ggpo_bb_sync_error(const char* msg) {
