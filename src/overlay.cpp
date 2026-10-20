@@ -127,7 +127,7 @@ static void DrawFrameAdvantage() {
 std::string CharacterNames(const std::string& codes) {
 	static const char* const kNames[][2] = {
 		{"ar", "Arakune"}, {"bn", "Bang"}, {"ca", "Carl"}, {"ha", "Hakumen"}, {"hz", "Hazama"}, {"jn", "Jin"},
-		{"lc", "Litchi"}, {"mk", "Makoto"}, {"mu", "Mu-12"}, {"no", "Noel"}, {"ny", "Nu-13"}, {"pt", "Platinum"},
+		{"lc", "Litchi"}, {"mk", "Makoto"}, {"mu", "Mu"}, {"no", "Noel"}, {"ny", "Lambda"}, {"pt", "Platinum"},
 		{"rc", "Rachel"}, {"rg", "Ragna"}, {"rl", "Relius"}, {"tb", "Tsubaki"}, {"tg", "Tager"}, {"tk", "Taokaka"},
 		{"vh", "Valkenhayn"},
 	};

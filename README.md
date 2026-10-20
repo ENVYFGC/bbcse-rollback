@@ -48,9 +48,11 @@ Version select:
 
 ## Palettes
 
-Folder: `bbcse-palettes\<code>\`, made at first launch.
+Folder: `bbcse-palettes\<name>\`, made at first launch. Same names as the BBCF Improvement Mod:
 
-`ar` Arakune, `bn` Bang, `ca` Carl, `ha` Hakumen, `hz` Hazama, `jn` Jin, `lc` Litchi, `mk` Makoto, `mu` Mu-12, `no` Noel, `ny` Nu-13, `pt` Platinum, `rc` Rachel, `rg` Ragna, `rl` Relius, `tb` Tsubaki, `tg` Tager, `tk` Taokaka, `vh` Valkenhayn
+Arakune, Bang, Carl, Hakumen, Hazama, Jin, Lambda, Litchi, Makoto, Mu, Noel, Platinum, Rachel, Ragna, Relius, Tager, Taokaka, Tsubaki, Valkenhayn
+
+Old folders (`rg`, `jn`...) are moved on first launch.
 
 - File name = palette name in `palettes.ini`.
 - Formats: `.cfpl`, `.hpl`, `.act`, `.png`. Editor PNG exports go to `bbcse-palettes\exports`; move them into a character folder to use them.

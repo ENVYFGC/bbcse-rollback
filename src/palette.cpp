@@ -174,7 +174,7 @@ std::string GameDir() {
 }
 
 std::string Root() { return GameDir() + "\\bbcse-palettes"; }
-std::string Folder(const std::string& code) { return Root() + "\\" + code; }
+std::string Folder(const std::string& code) { return Root() + "\\" + CharacterNames(code); }
 std::string IniPath() { return Root() + "\\palettes.ini"; }
 
 unsigned int Crc32(const unsigned char* data, size_t len, unsigned int crc = 0) {
@@ -902,10 +902,7 @@ void EnsureIni() {
 std::vector<std::string> IniPool(const std::string& code, int color, const std::vector<PalData>& custom, bool namedOnly) {
 	char buf[1024] = {};
 	const std::string key = std::to_string(color + 1);
-	for (const std::string& section : {CharacterNames(code), code}) {
-		GetPrivateProfileStringA(section.c_str(), key.c_str(), "", buf, sizeof(buf), IniPath().c_str());
-		if (buf[0]) break;
-	}
+	GetPrivateProfileStringA(CharacterNames(code).c_str(), key.c_str(), "", buf, sizeof(buf), IniPath().c_str());
 	std::vector<std::string> pool;
 	const std::string value = buf;
 	for (size_t start = 0; start <= value.size();) {
@@ -1388,20 +1385,17 @@ void DrawPaletteRow(SideState& s) {
 	const std::string section = CharacterNames(s.code), key = std::to_string(s.palIndex + 1);
 	char assigned[256] = {};
 	GetPrivateProfileStringA(section.c_str(), key.c_str(), "", assigned, sizeof(assigned), IniPath().c_str());
-	if (!assigned[0]) GetPrivateProfileStringA(s.code.c_str(), key.c_str(), "", assigned, sizeof(assigned), IniPath().c_str());
 	const std::string current = Trim(assigned);
 	ImGui::Text("Color %d: %s", s.palIndex + 1, current.empty() ? "game color" : current.c_str());
 	ImGui::SameLine();
 	ImGui::BeginDisabled(s.selected.empty() || _stricmp(current.c_str(), s.selected.c_str()) == 0);
 	if (ImGui::Button("Use for this color")) {
-		WritePrivateProfileStringA(s.code.c_str(), key.c_str(), nullptr, IniPath().c_str());
 		WritePrivateProfileStringA(section.c_str(), key.c_str(), ("\"" + s.selected + "\"").c_str(), IniPath().c_str());
 	}
 	ImGui::EndDisabled();
 	ImGui::SameLine();
 	ImGui::BeginDisabled(current.empty());
 	if (ImGui::Button("Clear")) {
-		WritePrivateProfileStringA(s.code.c_str(), key.c_str(), nullptr, IniPath().c_str());
 		WritePrivateProfileStringA(section.c_str(), key.c_str(), nullptr, IniPath().c_str());
 	}
 	ImGui::EndDisabled();
@@ -1705,8 +1699,48 @@ void Palette_SetDevice(IDirect3DDevice9* device) {
 	s_device = device;
 }
 
+void MoveOldFolder(const std::string& code) {
+	const std::string from = Root() + "\\" + code, to = Folder(code);
+	if (GetFileAttributesA(from.c_str()) == INVALID_FILE_ATTRIBUTES) return;
+	if (_stricmp(from.c_str(), to.c_str()) == 0) {
+		WIN32_FIND_DATAA fd;
+		HANDLE h = FindFirstFileA(from.c_str(), &fd);
+		if (h == INVALID_HANDLE_VALUE) return;
+		FindClose(h);
+		if (CharacterNames(code) == fd.cFileName) return;
+	}
+	if (_stricmp(from.c_str(), to.c_str()) == 0 || GetFileAttributesA(to.c_str()) == INVALID_FILE_ATTRIBUTES) {
+		if (MoveFileA(from.c_str(), to.c_str())) Palette_Log(("PALETTE: moved bbcse-palettes\\" + code + " to " + CharacterNames(code)).c_str());
+		return;
+	}
+	WIN32_FIND_DATAA fd;
+	HANDLE h = FindFirstFileA((from + "\\*").c_str(), &fd);
+	if (h != INVALID_HANDLE_VALUE) {
+		do {
+			if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+			if (!MoveFileA((from + "\\" + fd.cFileName).c_str(), (to + "\\" + fd.cFileName).c_str()))
+				Palette_Log(("PALETTE: kept bbcse-palettes\\" + code + "\\" + fd.cFileName + " (" + CharacterNames(code) + " has a file with that name)").c_str());
+		} while (FindNextFileA(h, &fd));
+		FindClose(h);
+	}
+	if (RemoveDirectoryA(from.c_str())) Palette_Log(("PALETTE: moved bbcse-palettes\\" + code + " into " + CharacterNames(code)).c_str());
+}
+
+void MoveOldSection(const char* from, const char* to) {
+	static char buf[32768];
+	char existing[8] = {};
+	const DWORD n = GetPrivateProfileSectionA(from, buf, sizeof(buf), IniPath().c_str());
+	if (!n || n >= sizeof(buf) - 2) return;
+	if (GetPrivateProfileSectionA(to, existing, sizeof(existing), IniPath().c_str())) return;
+	if (WritePrivateProfileSectionA(to, buf, IniPath().c_str())) WritePrivateProfileStringA(from, nullptr, nullptr, IniPath().c_str());
+}
+
 void Palette_Init() {
 	EnsureIni();
-	for (const char* code : {"ar", "bn", "ca", "ha", "hz", "jn", "lc", "mk", "mu", "no", "ny", "pt", "rc", "rg", "rl", "tb", "tg", "tk", "vh"})
+	MoveOldSection("Nu-13", "Lambda");
+	MoveOldSection("Mu-12", "Mu");
+	for (const char* code : {"ar", "bn", "ca", "ha", "hz", "jn", "lc", "mk", "mu", "no", "ny", "pt", "rc", "rg", "rl", "tb", "tg", "tk", "vh"}) {
+		MoveOldFolder(code);
 		CreateDirectoryA(Folder(code).c_str(), nullptr);
+	}
 }
