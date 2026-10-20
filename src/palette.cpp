@@ -1343,10 +1343,12 @@ void SyncControlSlots() {
 		const int file = *reinterpret_cast<const int*>(o + kObjFileOff);
 		if ((color != -1 && color != g_side[side].palIndex) || file < 0 || file >= kFiles) continue;
 		const unsigned char* src = GameFile(side, file);
+		const unsigned char* original = g_side[side].original[file];
+		if (!src || memcmp(src, original, kFileBytes) == 0) continue;
 		const unsigned char* list = *reinterpret_cast<const unsigned char* const*>(mgr + kSlotPalettesOff + slot * 4);
 		unsigned char* const* entries = list ? *reinterpret_cast<unsigned char* const* const*>(list + 4) : nullptr;
 		unsigned char* dst = entries && *reinterpret_cast<const int*>(list + 0xC) > 0 ? entries[0] : nullptr;
-		if (!src || !dst || memcmp(dst + kEntryColorsOff, src, kFileBytes) == 0) continue;
+		if (!dst || memcmp(dst + kEntryColorsOff, original, kFileBytes) != 0) continue;
 		memcpy(dst + kEntryColorsOff, src, kFileBytes);
 		memcpy(dst + kEntryCopyOff, src, kFileBytes);
 		*reinterpret_cast<int*>(dst + kEntryDirtyOff) = 1;
