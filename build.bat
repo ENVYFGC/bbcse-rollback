@@ -19,9 +19,9 @@ if not exist "%~dp0build" mkdir "%~dp0build"
 pushd "%~dp0build"
 set "G=%~dp0ggpo"
 set "I=%~dp0imgui"
-cl /nologo /std:c++17 /EHsc /O2 /W3 /MT /LD /D_WINDOWS /D_CRT_SECURE_NO_WARNINGS /DDIRECTINPUT_VERSION=0x0800 %DEFS% ^
+cl /nologo /std:c++17 /EHsc /O2 /W3 /MT /LD /D_WINDOWS /DNDEBUG /D_CRT_SECURE_NO_WARNINGS /DDIRECTINPUT_VERSION=0x0800 %DEFS% ^
    /I"%G%" /I"%G%\include" /I"%G%\network" /I"%G%\backends" /I"%I%" ^
-   "%~dp0src\dllmain.cpp" "%~dp0src\overlay.cpp" ^
+   "%~dp0src\dllmain.cpp" "%~dp0src\overlay.cpp" "%~dp0src\framedata.cpp" "%~dp0src\hitboxes.cpp" "%~dp0src\palette.cpp" "%~dp0src\imfont_droidsans.cpp" ^
    "%G%\main.cpp" "%G%\sync.cpp" "%G%\input_queue.cpp" "%G%\game_input.cpp" "%G%\bitvector.cpp" ^
    "%G%\log.cpp" "%G%\poll.cpp" "%G%\timesync.cpp" "%G%\platform_windows.cpp" ^
    "%G%\network\udp.cpp" "%G%\network\udp_proto.cpp" ^

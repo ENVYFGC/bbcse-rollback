@@ -11,7 +11,7 @@
 #include "backends/spectator.h"
 #include "ggponet.h"
 
-// bbcse: GGPO's DllMain removed (linked into dinput8.dll); dllmain.cpp calls srand.
+// bbcse: DllMain removed, linked into the proxy DLL
 
 void
 ggpo_log(GGPOSession *ggpo, const char *fmt, ...)

@@ -499,7 +499,7 @@ GGPO_API GGPOErrorCode __cdecl ggpo_disconnect_player(GGPOSession *,
  */
 GGPO_API GGPOErrorCode __cdecl ggpo_advance_frame(GGPOSession *);
 
-/* bbcse: last frame with every player's input received (-1 = none). */
+/* bbcse: last frame with all inputs received, -1 = none */
 GGPO_API int __cdecl ggpo_get_confirmed_frame(GGPOSession *);
 
 /*

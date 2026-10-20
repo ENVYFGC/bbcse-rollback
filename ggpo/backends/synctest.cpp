@@ -7,7 +7,7 @@
 
 #include "synctest.h"
 
-extern "C" void __cdecl ggpo_bb_sync_error(const char *msg);  // defined in dllmain.cpp
+extern "C" void __cdecl ggpo_bb_sync_error(const char *msg);  // bbcse: defined in dllmain.cpp
 
 SyncTestBackend::SyncTestBackend(GGPOSessionCallbacks *cb,
                                  char *gamename,
@@ -171,7 +171,7 @@ SyncTestBackend::RaiseSyncError(const char *fmt, ...)
    puts(buf);
    OutputDebugStringA(buf);
    EndLog();
-   ggpo_bb_sync_error(buf);  // bbcse: report instead of DebugBreak (no debugger = crash)
+   ggpo_bb_sync_error(buf);  // bbcse: report instead of DebugBreak
 }
 
 GGPOErrorCode

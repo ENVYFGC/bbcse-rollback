@@ -8,8 +8,7 @@
 #include "types.h"
 #include "udp.h"
 
-// bbcse: optional packet transport (Steam P2P). When set, no socket is opened; every
-// packet goes to / comes from the one peer, reported as ggpo_bb_peer_addr.
+// bbcse: optional packet transport (Steam P2P), no socket
 extern "C" {
    int (__cdecl *ggpo_bb_send)(const char *buf, int len) = NULL;
    int (__cdecl *ggpo_bb_recv)(char *buf, int cap) = NULL;  // > 0 = length, 0 = nothing
@@ -79,6 +78,7 @@ void
 Udp::SendTo(char *buffer, int len, int flags, struct sockaddr *dst, int destlen)
 {
    struct sockaddr_in *to = (struct sockaddr_in *)dst;
+   // bbcse: Steam P2P transport
    if (ggpo_bb_send) {
       ggpo_bb_send(buffer, len);
       return;
@@ -101,6 +101,7 @@ Udp::OnLoopPoll(void *cookie)
    sockaddr_in    recv_addr;
    int            recv_addr_len;
 
+   // bbcse: Steam P2P transport
    if (ggpo_bb_recv) {
       int len;
       while ((len = ggpo_bb_recv((char *)recv_buf, MAX_UDP_PACKET_SIZE)) > 0) {

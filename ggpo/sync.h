@@ -15,7 +15,7 @@
 #include "ring_buffer.h"
 #include "network/udp_msg.h"
 
-#define MAX_PREDICTION_FRAMES    8  // bbcse: GGPO default; the sync test proved N=7
+#define MAX_PREDICTION_FRAMES    8
 
 class SyncTestBackend;
 

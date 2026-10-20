@@ -1,83 +1,135 @@
 # bbcse-rollback
 
-Rollback netcode for **BlazBlue: Continuum Shift Extend** on Steam.
+Rollback netcode for **BlazBlue: Continuum Shift Extend** (Steam).
 
-## What it does
+## Features
 
-You get into matches the same way as always. The Network menu, lobbies and player matches are all still the game's own. Once the fight starts, the mod swaps the game's delay-based netcode for [GGPO](https://github.com/pond3r/ggpo), running over the same Steam connection the game was already using.
-
-To make rollback work, the mod saves the whole fight every frame (characters, projectiles, effects, camera, RNG, stage, UI) and rewinds it whenever your opponent's input shows up late. Both games also compare checksums as the match goes on, so if they ever drift apart you'll see it in the log right away.
-
-Spectating and replays still go through the game's own system, but they work with rollback now. Spectators get the fight from whoever's hosting the lobby, and that works whether the host is playing or just watching. Replays record the inputs that were actually used in the match, so they play back the fight you really had.
-
-It also fixes a few things that were broken anyway:
-
-- The Network menu wouldn't open. Now it does.
-- The game kept losing your online profile (D-Card) and asking you to make a new one, because Steam Cloud isn't enabled for it anymore. The mod keeps `DCARD.UMS` in a `bbcse-cloud` folder next to the game instead. If your old one is still on Steam Cloud, grab it from Steam's cloud page and drop it in that folder.
-- On plain Direct3D 9 the game could run at 30 fps, or bounce between 60 and 58. The mod keeps it at a steady 60 itself. If your graphics driver forces VSync on, it lets VSync do the pacing instead of fighting it.
-
-There are a few extras too. They're all off until you turn them on in the ini:
-
-- **Render size.** The game draws everything at 1280x768 and stretches it to fit your screen, which looks pretty rough at 1600x900 or 1920x1080. Give it your screen size and it draws at that size instead. It's the same trick the BBCF Improvement Mod uses for its viewport setting.
-- **Borderless window.** Put the game in window mode and the title bar goes away and the window fills the screen, so alt-tabbing is instant.
-- **Key remap.** Lets one key act as another, for keys the game won't let you bind, like `'`.
+- [GGPO](https://github.com/pond3r/ggpo) rollback in the game's own online matches, over Steam.
+- Full fight state saved every frame. Checksums compared during the match, desyncs logged.
+- Spectating and replays work with rollback. Spectators get the fight from the lobby host.
+- Network menu fixed.
+- Room list shows the room owner's Steam name.
+- D-Card kept in `bbcse-cloud` next to the game. The old one is copied from Steam's local cloud folder on first launch. Otherwise: download it from Steam's cloud page, put it in that folder.
+- Steady 60 fps on Direct3D 9. Driver-forced VSync is respected.
+- Optional (ini): render size, borderless window, key remap.
 
 ## Install
 
-1. In Steam, right-click BBCSE > Manage > Browse local files.
-2. Drop `dinput8.dll` and `bbcse-net.ini` next to `BBCSE.exe`.
-3. Play online like normal. **Both players need the mod**, and anyone spectating should have it too.
+1. Steam > right-click BBCSE > Manage > Browse local files.
+2. Put `dinput8.dll`, `bbcse-net.ini` and `bbcse-versions` next to `BBCSE.exe`. Updating: delete the old `bbcse-versions` first.
+3. Both players need the mod. Spectators too.
 
-To uninstall, just delete those two files. If your opponent doesn't have the mod, the match falls back to the game's normal netcode after a few seconds.
+Linux / Steam Deck: `winmm.dll` instead of `dinput8.dll`. Launch options: `WINEDLLOVERRIDES="winmm=n,b" %command%`
+
+Uninstall: delete `dinput8.dll` (or `winmm.dll`) and `bbcse-net.ini`. Left behind: `bbcse-cloud` (D-Card), `bbcse-palettes`, `bbcse-versions`, `bbcse-im.ini` (version and palette options), log and crash files.
+
+Opponent without the mod: the game's own netcode after 15 seconds.
+
+## IM BBCS:EX (F2)
+
+Training:
+
+- F3 frame advantage: startup, hit/block advantage, invul. Follow-ups (214A~214D) get their own startup.
+- F4 hitboxes.
+- Palette editor.
+
+Online:
+
+- F1 rollback panel: ping, rollback, frame advantage, frame times.
+- Ping and rollback bar, bottom center. On by default.
+- Palette options.
+
+Version select:
+
+- CSE, CS2, CS1. Characters, system rules and HUD from that version.
+- Files in `bbcse-versions`.
+- Online: the lobby host's pick applies to the room.
+- CS2/CS1: version shown top center during the fight.
+
+## Palettes
+
+Folder: `bbcse-palettes\<code>\`, made at first launch.
+
+`ar` Arakune, `bn` Bang, `ca` Carl, `ha` Hakumen, `hz` Hazama, `jn` Jin, `lc` Litchi, `mk` Makoto, `mu` Mu-12, `no` Noel, `ny` Nu-13, `pt` Platinum, `rc` Rachel, `rg` Ragna, `rl` Relius, `tb` Tsubaki, `tg` Tager, `tk` Taokaka, `vh` Valkenhayn
+
+- File name = palette name in `palettes.ini`.
+- Formats: `.cfpl`, `.hpl`, `.act`, `.png`. Editor PNG exports go to `bbcse-palettes\exports`; move them into a character folder to use them.
+- `.cfpl` from BBCF: effect files that differ from CF stay on the game's colors.
+- `.hpl` / `.act`: `name` = character, `name_effect01` to `name_effect07` = effects.
+- Editor saves `.cfpl`.
+- Editor: edit, highlight, gradient, undo/redo, save, PNG export, effect preview.
+- Use for this color: assigns the palette to a color slot, character select included. Saved in `bbcse-palettes\palettes.ini`:
+
+```ini
+[Ragna]
+1="Fox"
+5="Fox,Panda,Default"
+```
+
+List = random pick per match, character select shows the first. `Default` = game color. `Random` = any. `Random_Exclude_Default` = any custom.
+
+Online (F2 > Online):
+
+- Custom palettes are shown to the opponent.
+- Show the opponent's custom palette.
+- Let opponents save my palette.
+- Save their palette: goes in the character folder.
+- Block palette / Block player: `bbcse-palettes\blocked.ini`, unblock in the menu.
 
 ## Settings
 
-Everything lives in `bbcse-net.ini`. Here's what it looks like out of the box:
+`bbcse-net.ini`:
 
 ```ini
+; BBCSE rollback settings. Delete this file to play with the game's own netcode.
 [net]
-; rollback in online matches
+; steam = rollback in online matches
 mode=steam
 ; input delay in frames
 delay=2
-; 0 = the mod keeps the game at a steady 60, 1 = use VSync and the game's own limiter
+; 0 = the mod keeps 60 fps, 1 = VSync and the game's limiter
 vsync=0
 
 [display]
-; these only work with vsync=0
-; the size the game draws at, e.g. 1920 and 1080. 0 = the game's own 1280x768
+; draw size, e.g. 1920 and 1080. 0 = 1280x768
 renderwidth=0
 renderheight=0
-; 1 = no title bar, window fills the screen (set the game to window mode at your screen size)
+; 1 = borderless, with the game in window mode at screen size
 borderless=0
 
 [keys]
+; key pressed=key the game sees, e.g. apostrophe=P
 ```
 
-Keep comments on their own line. Windows doesn't strip comments after a value, so `mode=steam ; comment` gets read as `steam ; comment` and rollback won't turn on.
+Comments on their own line only. `mode=steam ; comment` breaks it.
 
-To remap a key, add a line under `[keys]` in the form `key you press=key the game sees`. For example, `apostrophe=P` makes `'` act as P. Bind P in the game's key config and `'` will do it.
+Key remap under `[keys]`: `pressed=seen`. Example: `apostrophe=P`, then bind P in the game.
 
-Key names: letters, digits, `apostrophe semicolon comma period slash backslash grave minus equals lbracket rbracket space tab capslock enter backspace lshift rshift lctrl rctrl lalt ralt up down left right insert delete home end pageup pagedown num0`–`num9`. You can also use a DirectInput key code like `0x28`.
+Key names: letters, digits, `apostrophe semicolon comma period slash backslash grave minus equals lbracket rbracket space tab capslock enter backspace lshift rshift lctrl rctrl lalt ralt up down left right insert delete home end pageup pagedown num0` to `num9`, or a DirectInput code like `0x28`.
 
-## Reporting bugs
+## Bug reports
 
-Hit **F1** during an online fight for a small panel with ping, rollback depth, frame advantage and frame times. The mod also writes everything to `bbcse-probe.log` in the game folder. That's the file to send with a bug report. Grab it before you restart the game, because restarting replaces it.
+Send `bbcse-probe.log` from the game folder. After a desync or crash, also `bbcse-desync.bin` and `bbcse-crash.txt` if present.
 
-## Building it yourself
+## Build
 
-You'll need Visual Studio 2019 or 2022 with the C++ desktop workload. Then run:
+Visual Studio 2019/2022, C++ desktop workload.
 
 ```
 build.bat
 ```
 
-The DLL ends up in `build\`. BBCSE is 32-bit, so the DLL has to be too; the script handles that. `build.bat dev` also adds some developer hotkeys (F2–F11: sync test, input recorder, save/load state, freeze, frame step) that normal builds leave out.
+- Output: `build\`.
+- `build_winmm.bat`: Linux build.
+- 32-bit only.
+- `build.bat dev`: developer hotkeys (sync test, input recorder, save/load state, freeze, frame step).
 
 ## Credits
 
-- [GGPO](https://github.com/pond3r/ggpo), MIT license (`ggpo/LICENSE.txt`). The copy here has a few small changes, marked with `bbcse:`.
-- [Dear ImGui](https://github.com/ocornut/imgui), MIT license (`imgui/LICENSE.txt`).
-- The Network menu fix uses the same idea as Geo's patcher, just done in memory instead of patching the exe.
+- [GGPO](https://github.com/pond3r/ggpo) (GroundStorm Studios), through the BBCF-Improvement-Mod-GGPO fork, MIT (`ggpo/LICENSE-GroundStorm.txt`, `ggpo/LICENSE.txt`). Changes marked `bbcse:`.
+- [Dear ImGui](https://github.com/ocornut/imgui), MIT (`imgui/LICENSE.txt`). Win32 backend mouse scaling from the BBCF Improvement Mod, marked `bbcse:`.
+- BBCF Improvement Mod, GPL-3: frame advantage, hitboxes, palette editor. Palette features from [HaiKamDesu's fork](https://github.com/HaiKamDesu/BBCF-Improvement-Mod).
+- DroidSans (Google), Apache 2.0 (`LICENSE-DroidSans.txt`).
+- Network menu fix: same idea as Geo's patcher, done in memory.
 
-Not affiliated with Arc System Works. No game files are included, so you'll need your own copy of BBCSE on Steam.
+Not affiliated with Arc System Works.

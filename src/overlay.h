@@ -1,5 +1,3 @@
-// Stats shared between dllmain.cpp and the overlay.
-
 #pragma once
 
 struct IDirect3DDevice9;
@@ -15,11 +13,23 @@ struct OverlayStats {
 	int heldLimit = 0, heldPause = 0, heldSync = 0, heldConnect = 0;
 	float tickAvgMs = 0, tickMaxMs = 0, saveMs = 0, loadMs = 0, replayMs = 0, inputDelay = 0;
 	int desyncFrame = -1, syncChecks = 0;
+	char version[16] = "cse", peerVersion[16] = "";
+	bool versionMismatch = false;
 	float rollbackHistory[kHistory] = {}, tickMsHistory[kHistory] = {};
 	int historyPos = 0;
 };
 extern OverlayStats g_ovl;
 
 void Overlay_OnPresent(IDirect3DDevice9* dev);
+
+#include <string>
+#include <vector>
+void Version_List(std::vector<std::string>& out);
+const char* Version_Current();
+bool Version_Locked();
+bool Version_InFight();
+const char* Version_ForcedReason();
+std::string Version_LoadedCodes();
+void Version_Select(const char* name);
 void Overlay_BeforeReset();
 void Overlay_AfterReset();

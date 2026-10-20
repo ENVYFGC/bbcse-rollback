@@ -37,9 +37,7 @@
 //#define IMGUI_DISABLE_DEMO_WINDOWS                        // Disable demo windows: ShowDemoWindow()/ShowStyleEditor() will be empty.
 //#define IMGUI_DISABLE_DEBUG_TOOLS                         // Disable metrics/debugger and other debug tools: ShowMetricsWindow(), ShowDebugLogWindow() and ShowIDStackToolWindow() will be empty.
 
-//---- BBCF-IM: the mod never enables ImGui gamepad navigation and runs its own controller stack
-//     (Core/XInputRuntime, ControllerOverrideManager, the DirectInput/XInput hooks, plus Wine
-//     handling). Stop the Win32 backend from loading XInput behind all of that.
+//---- bbcse: no gamepad navigation, the backend does not load XInput
 #define IMGUI_IMPL_WIN32_DISABLE_GAMEPAD
 
 //---- Don't implement some functions to reduce linkage requirements.

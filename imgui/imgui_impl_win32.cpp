@@ -112,22 +112,20 @@ typedef DWORD(WINAPI* PFN_XInputGetState)(DWORD, XINPUT_STATE*);
 #pragma GCC diagnostic ignored "-Wcast-function-type"       // warning: cast between incompatible function types (for loader)
 #endif
 
-// BBCF Improvement Mod local modification - see imgui_impl_win32.h and
-// docs/ViewportMouseScaling.md. Kept as a file static rather than a field of
-// ImGui_ImplWin32_Data so it survives before Init and after Shutdown.
-static float g_bbcfMousePosScaleX = 1.0f;
-static float g_bbcfMousePosScaleY = 1.0f;
+// bbcse: mouse position scale, see imgui_impl_win32.h
+static float g_mousePosScaleX = 1.0f;
+static float g_mousePosScaleY = 1.0f;
 
 void ImGui_ImplWin32_SetMousePosScale(float scale_x, float scale_y)
 {
-    g_bbcfMousePosScaleX = (scale_x > 0.0f) ? scale_x : 1.0f;
-    g_bbcfMousePosScaleY = (scale_y > 0.0f) ? scale_y : 1.0f;
+    g_mousePosScaleX = (scale_x > 0.0f) ? scale_x : 1.0f;
+    g_mousePosScaleY = (scale_y > 0.0f) ? scale_y : 1.0f;
 }
 
-// The sentinel used for "mouse left the window" must pass through untouched.
+// bbcse: scaled mouse position
 static void ImGui_ImplWin32_AddScaledMousePosEvent(ImGuiIO& io, float x, float y)
 {
-    io.AddMousePosEvent(x * g_bbcfMousePosScaleX, y * g_bbcfMousePosScaleY);
+    io.AddMousePosEvent(x * g_mousePosScaleX, y * g_mousePosScaleY);
 }
 
 struct ImGui_ImplWin32_Data
@@ -342,7 +340,7 @@ static void ImGui_ImplWin32_UpdateMouseData(ImGuiIO& io)
         // (Optional) Set OS mouse position from Dear ImGui if requested (rarely used, only when io.ConfigNavMoveSetMousePos is enabled by user)
         if (io.WantSetMousePos)
         {
-            POINT pos = { (int)(io.MousePos.x / g_bbcfMousePosScaleX), (int)(io.MousePos.y / g_bbcfMousePosScaleY) };
+            POINT pos = { (int)(io.MousePos.x / g_mousePosScaleX), (int)(io.MousePos.y / g_mousePosScaleY) }; // bbcse
             if (::ClientToScreen(bd->hWnd, &pos))
                 ::SetCursorPos(pos.x, pos.y);
         }
@@ -353,7 +351,7 @@ static void ImGui_ImplWin32_UpdateMouseData(ImGuiIO& io)
         {
             POINT pos;
             if (::GetCursorPos(&pos) && ::ScreenToClient(bd->hWnd, &pos))
-                ImGui_ImplWin32_AddScaledMousePosEvent(io, (float)pos.x, (float)pos.y);
+                ImGui_ImplWin32_AddScaledMousePosEvent(io, (float)pos.x, (float)pos.y); // bbcse
         }
     }
 }
@@ -677,7 +675,7 @@ IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandlerEx(HWND hwnd, UINT msg, WPA
         if (msg == WM_NCMOUSEMOVE) // WM_NCMOUSEMOVE are absolute coordinates.
              ::ScreenToClient(hwnd, &mouse_pos);
         io.AddMouseSourceEvent(mouse_source);
-        ImGui_ImplWin32_AddScaledMousePosEvent(io, (float)mouse_pos.x, (float)mouse_pos.y);
+        ImGui_ImplWin32_AddScaledMousePosEvent(io, (float)mouse_pos.x, (float)mouse_pos.y); // bbcse
         return 0;
     }
     case WM_MOUSELEAVE:

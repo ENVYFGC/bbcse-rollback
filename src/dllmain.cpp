@@ -1,7 +1,5 @@
-// BBCSE rollback - dinput8.dll proxy for BlazBlue: Continuum Shift Extend (Steam).
-// Forwards DirectInput8Create to the system dinput8.dll and hooks the game's battle loop:
-// GGPO rollback over the game's own Steam P2P connection, per-frame state save/load,
-// frame pacing, the Network menu fix and an F1 stats overlay.
+// BBCSE rollback: dinput8.dll / winmm.dll proxy for BlazBlue: Continuum Shift Extend (Steam).
+// GGPO rollback over the game's Steam P2P connection, frame pacing, display options and the F2 menu.
 
 #include <winsock2.h>
 #include <windows.h>
@@ -11,12 +9,16 @@
 
 #include "ggponet.h"
 #include "overlay.h"
+#include "framedata.h"
+#include "hitboxes.h"
+#include "palette.h"
 
 #include <share.h>
 #include <io.h>
 
 #include <cstdio>
 #include <algorithm>
+#include <map>
 #include <array>
 #include <string>
 #include <vector>
@@ -25,10 +27,35 @@ extern "C" int (__cdecl* ggpo_bb_send)(const char* buf, int len);
 extern "C" int (__cdecl* ggpo_bb_recv)(char* buf, int cap);
 extern "C" sockaddr_in ggpo_bb_peer_addr;
 
+#ifdef BBCSE_PROXY_WINMM
+#include <delayimp.h>
+#include "proxy_winmm.inc"
+HMODULE g_realWinmm = nullptr;
+bool LoadRealWinmm(HMODULE self) {
+	char sys[MAX_PATH]{};
+	GetSystemDirectoryA(sys, MAX_PATH);
+	const std::string path = std::string(sys) + "\\winmm.dll";
+	HMODULE m = LoadLibraryA(path.c_str());
+	if (!m || m == self) return false;
+	g_realWinmm = m;
+	for (int i = 0; i < kWinmmExports; ++i)
+		g_winmm[i] = g_winmmName[i] ? GetProcAddress(m, g_winmmName[i])
+		                            : GetProcAddress(m, MAKEINTRESOURCEA(g_winmmOrd[i]));
+	return true;
+}
+FARPROC WINAPI WinmmDelayHook(unsigned note, PDelayLoadInfo info) {
+	if (note == dliNotePreLoadLibrary && info && _stricmp(info->szDll, "winmm.dll") == 0 && g_realWinmm)
+		return reinterpret_cast<FARPROC>(g_realWinmm);
+	return nullptr;
+}
+extern "C" const PfnDliHook __pfnDliNotifyHook2 = WinmmDelayHook;
+#endif
+
 namespace {
 using DirectInput8Create_t = HRESULT(WINAPI*)(HINSTANCE, DWORD, REFIID, LPVOID*, LPUNKNOWN);
 
 HMODULE g_realDinput = nullptr;
+HMODULE g_self = nullptr;
 DirectInput8Create_t g_realCreate = nullptr;
 FILE* g_log = nullptr;
 
@@ -83,6 +110,7 @@ bool LoadRealDinput() {
 	return true;
 }
 
+#ifdef BBCSE_DEV_TOOLS
 void ReportProcess() {
 	char exe[MAX_PATH]{};
 	GetModuleFileNameA(nullptr, exe, MAX_PATH);
@@ -108,6 +136,7 @@ void ReportProcess() {
 			sec->SizeOfRawData);
 	}
 }
+#endif
 
 constexpr DWORD kImage = 0x400000;
 constexpr DWORD kUpdateBattle = 0x497E30;
@@ -128,7 +157,7 @@ void RestoreCtrls(const std::string& s);
 extern std::string g_ctrlSnap;
 extern int g_ctrlCount;
 
-BYTE* Live(DWORD ghidraVa) { return g_base + (ghidraVa - kImage); }
+BYTE* Live(DWORD va) { return g_base + (va - kImage); }
 
 int P1FrameCounter() {
 	auto p1 = *reinterpret_cast<BYTE**>(g_base + kP1Ptr);
@@ -179,23 +208,19 @@ int __cdecl HookIsBattlePaused() {
 }
 
 constexpr int kRegions = 16;
-
 constexpr DWORD kPoolPtrOff = 0x62650;
 constexpr DWORD kPoolSize = 400 * 0x20E8;
 constexpr DWORD kListOffs[3] = {0x62644, 0x62648, 0x6264C};
-
 constexpr DWORD kScrollList = 0xB7B6C4;
 constexpr DWORD kScrollFallback = 0x40;
-
-constexpr DWORD kZoomGuess = 0xB7C40C;
-
+constexpr DWORD kCameraZoom = 0xB7C40C;
 constexpr DWORD kRenderView = 0xB8C9D0;
 constexpr DWORD kRenderViewSize = 0x220;
-
 constexpr DWORD kEtcMgr = 0xEEE2D8;
 constexpr DWORD kEtcMgrSize = 0x243240;
 constexpr DWORD kObjMgr = 0xDF2C00;
-
+constexpr DWORD kGameModeVa = 0xBC12D8 + 8;
+constexpr int kModeTraining = 10;
 constexpr DWORD kObjMgrSize = 0x8375C;
 constexpr DWORD kCharsPtrOff = 0x62654;
 constexpr DWORD kCharsSize = 2 * 0x20140;
@@ -203,7 +228,6 @@ constexpr DWORD kRngArrayPtr = 0xB7C394;
 constexpr DWORD kRngSize = 0x9CC;
 constexpr DWORD kCamera = 0xE78400;
 constexpr DWORD kCameraSize = 0x13C;
-
 constexpr DWORD kClocks[] = {0xBC12D8, 0xCE3DB0, 0xCE3E9C};
 
 struct Region { const char* name; BYTE* addr; DWORD size; };
@@ -271,13 +295,11 @@ bool CurrentRegions(Region out[kRegions]) {
 	if (rngCount <= 0 || rngCount > 64) return false;
 	out[0] = {"objmgr", mgr, kObjMgrSize};
 	out[1] = {"chars", chars, kCharsSize};
-
 	out[2] = {"rng0", rng, kRngSize};
 	out[15] = {"rng", rng + kRngSize, static_cast<DWORD>(rngCount - 1) * kRngSize};
 	out[3] = {"camera", Live(kCamera), kCameraSize};
-
 	for (int i = 0; i < 3; ++i) out[4 + i] = {"clock", Live(kClocks[i]), 0};
-	out[7] = {"zoom?", Live(kZoomGuess), 0};
+	out[7] = {"zoom", Live(kCameraZoom), 0};
 	out[8] = {"rview", Live(kRenderView), 0};
 	out[9] = {"etcmgr", Live(kEtcMgr), kEtcMgrSize};
 	BYTE* const* list = reinterpret_cast<BYTE* const*>(Live(kScrollList));
@@ -297,6 +319,7 @@ bool CurrentRegions(Region out[kRegions]) {
 	return true;
 }
 
+#ifdef BBCSE_DEV_TOOLS
 constexpr DWORD kDataRva = 0x636000, kDataSize = 0xD63118;
 constexpr DWORD kMaxHeapScan = 64u << 20;
 
@@ -308,7 +331,6 @@ void AllocationOf(BYTE* p, BYTE*& start, DWORD& size) {
 	VirtualQuery(p, &mbi, sizeof(mbi));
 	start = static_cast<BYTE*>(mbi.AllocationBase);
 	BYTE* cur = start;
-
 	constexpr DWORD kReadable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
 	                            PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
 	while (VirtualQuery(cur, &mbi, sizeof(mbi)) && mbi.AllocationBase == start &&
@@ -353,7 +375,7 @@ void ScanDiff() {
 			if (runs <= 80) {
 				BYTE* at = a.addr + runStart;
 				if (a.name[0] == 'd')
-					Log("  DIFF data  ghidra %08X len %4lu  old %08X now %08X", static_cast<DWORD>(at - g_base) + kImage,
+					Log("  DIFF data  va %08X len %4lu  old %08X now %08X", static_cast<DWORD>(at - g_base) + kImage,
 						runEnd - runStart, *reinterpret_cast<const DWORD*>(old + runStart), *reinterpret_cast<DWORD*>(at));
 				else
 					Log("  DIFF heap  %p (P1%+ld) len %4lu  old %08X now %08X", at, static_cast<long>(at - p1),
@@ -378,6 +400,7 @@ constexpr DWORD kBgMgr = 0xDECB70;
 constexpr DWORD kStageProbe = 0x4000;
 struct StageCopy { BYTE* obj = nullptr; std::string copy; };
 StageCopy g_stage[2];
+#endif
 
 bool ReadableRange(const BYTE* p, DWORD n) {
 	MEMORY_BASIC_INFORMATION mbi{};
@@ -393,6 +416,7 @@ bool ReadableRange(const BYTE* p, DWORD n) {
 	return true;
 }
 
+#ifdef BBCSE_DEV_TOOLS
 void ReportHeapBlock(const char* what, const void* p) {
 	const SIZE_T s = HeapBlockSize(p);
 	if (s) Log("  %s %p: heap block size 0x%X", what, p, static_cast<unsigned>(s));
@@ -444,6 +468,7 @@ void StageDiff() {
 		Log("STAGE[%d] %s: %u changed runs in first 0x%X bytes", i, ClassOf(s.obj), runs, kStageProbe);
 	}
 }
+#endif
 
 constexpr DWORD kParticleReg = 0xB7B7E8, kParticleRegSize = 0x54;
 struct Pool { DWORD listOff, slotSize, count; };
@@ -468,10 +493,11 @@ using FxSetup_t = int(__cdecl*)();
 FxSetup_t g_origFxSetup = nullptr;
 extern bool g_ringReset;
 int g_autoCountdown = -1;
-
+#ifdef BBCSE_DEV_TOOLS
 constexpr const char* kRecFile = "bbcse-dev/recording.bin";
 constexpr const char* kAutoFlag = "bbcse-dev/autotest.on";
 constexpr const char* kDumpDir = "bbcse-dev/dumps";
+#endif
 
 void NetBattleStart();
 
@@ -597,6 +623,7 @@ bool RestoreParticles(const ParticleSnap& p) {
 
 ParticleSnap g_partSnap;
 
+#ifdef BBCSE_DEV_TOOLS
 void SaveState() {
 	Region r[kRegions];
 	if (!CurrentRegions(r)) { Log("SAVE failed: battle not set up"); return; }
@@ -616,7 +643,6 @@ void SaveState() {
 	Log("  save fx     %s", g_partSnap.valid ? "effect pools saved" : "NOT saved: pools not captured yet");
 	Log("  save ctrl   %d controllers, %u bytes", g_ctrlCount, static_cast<unsigned>(g_ctrlSnap.size()));
 	Log("SAVE ok: %lu bytes, P1 frame %d", total, P1FrameCounter());
-
 }
 
 void LoadState() {
@@ -674,12 +700,16 @@ extern "C" void __cdecl RecordCall(int slot, DWORD self, DWORD ret, DWORD arg0) 
 	}
 INPUT_THUNK(0) INPUT_THUNK(1) INPUT_THUNK(2) INPUT_THUNK(3) INPUT_THUNK(4) INPUT_THUNK(5)
 void (*const kThunks[kSlotCount])() = {Thunk0, Thunk1, Thunk2, Thunk3, Thunk4, Thunk5};
+#endif
 
 LONG g_flowGen = 0;
 DWORD g_flowTarget[2];
-#define FLOW_THUNK(N)                                                    	__declspec(naked) void FlowThunk##N() {                                		__asm lock inc dword ptr [g_flowGen]                                 		__asm jmp dword ptr [g_flowTarget + 4 * N]                           	}
+#define FLOW_THUNK(N)                                \
+	__declspec(naked) void FlowThunk##N() {          \
+		__asm lock inc dword ptr [g_flowGen]             \
+		__asm jmp dword ptr [g_flowTarget + 4 * N]       \
+	}
 void NetBarrier();
-
 __declspec(naked) void FlowThunk0() {
 	__asm pushad
 	__asm call NetBarrier
@@ -709,6 +739,7 @@ void InstallFlowHooks() {
 	Log("round-flow hooks installed (scene round setup, pause menu)");
 }
 
+#ifdef BBCSE_DEV_TOOLS
 void InstallInputProbe() {
 	DWORD* vt = reinterpret_cast<DWORD*>(Live(kBattleKeyVtbl)) + kFirstSlot;
 	for (int i = 0; i < kSlotCount; ++i) {
@@ -731,12 +762,13 @@ void DumpInputProbe() {
 	Log("INPUT PROBE: %ld call sites (overflow %ld) since last dump", g_siteCount, g_siteOverflow);
 	for (LONG i = 0; i < g_siteCount; ++i) {
 		const CallSite& s = g_sites[i];
-		Log("  slot %d  this %08X  from ghidra %08X  calls %6ld  lastArg %08X", kFirstSlot + s.slot, s.self,
+		Log("  slot %d  this %08X  from %08X  calls %6ld  lastArg %08X", kFirstSlot + s.slot, s.self,
 			s.ret - reinterpret_cast<DWORD>(g_base) + kImage, s.count, s.lastArg);
 	}
 	g_siteCount = 0;
 	g_siteOverflow = 0;
 }
+#endif
 
 constexpr DWORD kPollFn = 0x45BB90, kPollSite = 0x45C370;
 constexpr int kMaxCtrls = 8, kRingNodes = 50;
@@ -863,14 +895,11 @@ bool IsPoolHandle(size_t off) {
 	const size_t o = off % kPoolStride;
 	return o >= kPoolHandleOff && o < kPoolHandleEnd;
 }
-
 struct LiveField { const char* region; DWORD off; DWORD len = 4; };
-
 constexpr LiveField kLiveFields[] = {
 	{"etcmgr", 0x242A30}, {"etcmgr", 0x242A3C}, {"etcmgr", 0x242A44}, {"etcmgr", 0x242A4C},
 	{"etcmgr", 0x242A54}, {"etcmgr", 0x242A5C}, {"etcmgr", 0x242A64}, {"etcmgr", 0x242A6C},
 	{"etcmgr", 0x242A74}, {"etcmgr", 0x242A8C},
-
 	{"scroll", 0x4C, 0x40}};
 bool IsLiveField(const char* region, size_t off) {
 	for (const LiveField& f : kLiveFields)
@@ -926,6 +955,7 @@ std::string g_splitCopy;
 DWORD g_splitCopyFrame = 0;
 int g_splitCopyReplay = 0;
 
+#ifdef BBCSE_DEV_TOOLS
 void PoolHashes(DWORD out[kPoolSlots]) {
 	Region r[kRegions];
 	if (!CurrentRegions(r)) { memset(out, 0, kPoolSlots * 4); return; }
@@ -960,7 +990,6 @@ void CheckFrame() {
 		PoolHashes(&g_objRec[g_frameIdx * kPoolSlots]);
 		return;
 	}
-
 	if (!g_splitCopy.empty() && g_splitCopyReplay == g_replayNo - 1 && g_frameIdx == g_splitCopyFrame)
 		DiffPoolAgainstCopy();
 	if (g_divergenceLogged || g_frameIdx >= g_hashRec.size() || now == g_hashRec[g_frameIdx]) return;
@@ -1052,15 +1081,16 @@ void FinishReplay() {
 	g_endPrev = std::move(b);
 	g_inMode = InMode::Idle;
 }
+#endif
 
 constexpr int kRing = 8;
-
 constexpr int kPhaseWords = 6;
 struct Slot { std::string r[kRegions]; BYTE* addr[kRegions]; DWORD size[kRegions]; std::string ctrl; ParticleSnap fx;
               DWORD phase[kPhaseWords] = {}; LONG flowGen = 0; LONG frame = -1;
               bool hasScene = false; DWORD scene[3] = {};
               BYTE* uiPtr[10] = {}; DWORD ui[10][5] = {};
-              DWORD rec[3] = {}; };
+              DWORD rec[3] = {};
+              LONG poolSeq = -1; };
 
 void PhaseSignature(const Region r[kRegions], DWORD out[kPhaseWords]) {
 	const BYTE* mgr = r[0].addr;
@@ -1070,20 +1100,19 @@ void PhaseSignature(const Region r[kRegions], DWORD out[kPhaseWords]) {
 	out[2] = *reinterpret_cast<const DWORD*>(mgr + 0x62680);
 	out[3] = *reinterpret_cast<const DWORD*>(mgr + 0x62684);
 	out[4] = *reinterpret_cast<const DWORD*>(etc + 0x242868);
-
 	out[5] = *reinterpret_cast<const DWORD*>(mgr + 0x62658) & 0xFFFE0000;
 }
 Slot g_ring[kRing];
 static_assert(kRing == kMaskRing, "mask ring must match the sync ring");
 static_assert(kRing == kPauseRing, "pause ring must match the sync ring");
 bool g_ringReset = false;
-
 int g_resimArg = 0;
 int g_stepLogs = 0;
 LONG g_syncBarriers = 0;
 LONG g_autoTests = 0, g_autoFails = 0;
 int g_dumpCount = 0;
 
+#ifdef BBCSE_DEV_TOOLS
 void DumpSplit(const Slot& real, LONG frame, int step) {
 	CreateDirectoryA(kDumpDir, nullptr);
 	char path[MAX_PATH];
@@ -1109,6 +1138,7 @@ void DumpSplit(const Slot& real, LONG frame, int step) {
 	++g_dumpCount;
 	Log("  dumped real + replayed state to %s", path);
 }
+#endif
 int g_syncN = 0;
 LONG g_syncFrame = 0;
 LONG g_syncTests = 0, g_syncFails = 0, g_syncFailLogs = 0;
@@ -1153,7 +1183,6 @@ bool SceneFighting() {
 }
 
 constexpr DWORD kUiObjList = 0xBCE9C8;
-
 constexpr DWORD kFadeFieldOff = 4, kFadeFieldBytes = 5 * 4;
 void SaveUiObjs(Slot& s) {
 	BYTE* const* list = reinterpret_cast<BYTE* const*>(Live(kUiObjList));
@@ -1168,10 +1197,127 @@ void RestoreUiObjs(const Slot& s) {
 		if (s.uiPtr[i] && list[i] == s.uiPtr[i]) memcpy(list[i] + kFadeFieldOff, s.ui[i], kFadeFieldBytes);
 }
 
+constexpr DWORD kPoolNewSite = 0x48C761, kPoolNewFn = 0x5DF7DF, kPoolObjOff = 4;
+constexpr int kPoolHist = 64;
+using OpNew_t = void*(__cdecl*)(size_t);
+BYTE* g_poolMem = nullptr;
+DWORD g_poolPages = 0;
+LONG g_poolSeq = 0;
+std::vector<BYTE> g_poolDirty[kPoolHist];
+bool g_poolCheck = false;
+LONG g_ppSaves = 0, g_ppFull = 0, g_ppPages = 0, g_ppLoads = 0, g_ppLoadPages = 0, g_ppMismatch = 0;
+
+void* __cdecl HookPoolNew(size_t n) {
+	void* p = VirtualAlloc(nullptr, n, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE);
+	if (!p) {
+		Log("POOL: write-watch allocation failed (%lu); the pool is saved whole", GetLastError());
+		return reinterpret_cast<OpNew_t>(Live(kPoolNewFn))(n);
+	}
+	g_poolMem = static_cast<BYTE*>(p);
+	g_poolPages = static_cast<DWORD>((n + 4095) / 4096);
+	for (auto& d : g_poolDirty) d.assign(g_poolPages, 0);
+	g_poolSeq += kPoolHist + 1;
+	Log("POOL: object pool %p, %lu pages, write-watched", p, g_poolPages);
+	return p;
+}
+
+constexpr DWORD kPoolDelSiteA = 0x48B7ED, kPoolDelSiteB = 0x48CE6F, kOpDeleteFn = 0x5F3A44;
+using OpDelete_t = void(__cdecl*)(void*);
+void __cdecl HookPoolDelete(void* p) {
+	if (p && p == g_poolMem) {
+		VirtualFree(p, 0, MEM_RELEASE);
+		g_poolMem = nullptr;
+		Log("POOL: object pool %p freed (battle over)", p);
+		return;
+	}
+	reinterpret_cast<OpDelete_t>(Live(kOpDeleteFn))(p);
+}
+
+void PoolCollect(std::vector<BYTE>& out) {
+	static std::vector<PVOID> addrs;
+	addrs.resize(g_poolPages);
+	ULONG_PTR count = addrs.size();
+	ULONG gran = 0;
+	if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, g_poolMem, static_cast<SIZE_T>(g_poolPages) * 4096, addrs.data(), &count,
+	                  &gran) != 0) {
+		std::fill(out.begin(), out.end(), BYTE(1));
+		return;
+	}
+	for (ULONG_PTR i = 0; i < count; ++i) out[(static_cast<BYTE*>(addrs[i]) - g_poolMem) / 4096] = 1;
+}
+bool PoolWatched(const Region& r) { return g_poolMem && r.addr == g_poolMem + kPoolObjOff && r.size == kPoolSize; }
+bool PoolSince(LONG since, std::vector<BYTE>& out) {
+	if (since < 0 || since > g_poolSeq || g_poolSeq - since >= kPoolHist) return false;
+	for (LONG q = since + 1; q <= g_poolSeq; ++q) {
+		const std::vector<BYTE>& d = g_poolDirty[q % kPoolHist];
+		for (DWORD i = 0; i < g_poolPages; ++i) out[i] |= d[i];
+	}
+	return true;
+}
+LONG PoolCopyPages(const std::vector<BYTE>& pages, std::string& buf, bool toSave) {
+	LONG n = 0;
+	for (DWORD p = 0; p < g_poolPages; ++p) {
+		if (!pages[p]) continue;
+		const DWORD lo = (std::max)(p * 4096, kPoolObjOff) - kPoolObjOff;
+		const DWORD hi = (std::min)((p + 1) * 4096, kPoolObjOff + kPoolSize) - kPoolObjOff;
+		if (lo >= hi) continue;
+		BYTE* live = g_poolMem + kPoolObjOff + lo;
+		if (toSave) memcpy(&buf[lo], live, hi - lo);
+		else memcpy(live, buf.data() + lo, hi - lo);
+		++n;
+	}
+	return n;
+}
+bool PoolSave(Slot& s, const Region& r) {
+	if (!PoolWatched(r)) { s.poolSeq = -1; return false; }
+	++g_poolSeq;
+	std::vector<BYTE>& now = g_poolDirty[g_poolSeq % kPoolHist];
+	std::fill(now.begin(), now.end(), BYTE(0));
+	PoolCollect(now);
+	static std::vector<BYTE> pages;
+	pages.assign(g_poolPages, 0);
+	++g_ppSaves;
+	const bool incremental = s.r[11].size() == r.size && s.addr[11] == r.addr && PoolSince(s.poolSeq, pages);
+	if (incremental) {
+		g_ppPages += PoolCopyPages(pages, s.r[11], true);
+		if (g_poolCheck && memcmp(s.r[11].data(), r.addr, r.size) != 0) {
+			const BYTE* a = reinterpret_cast<const BYTE*>(s.r[11].data());
+			DWORD off = 0;
+			while (off < r.size && a[off] == r.addr[off]) ++off;
+			if (++g_ppMismatch <= 20)
+				Log("POOL: SAVE MISMATCH at pool +0x%lX (page %lu), copying since save %ld; copied whole", off,
+				    (off + kPoolObjOff) / 4096, s.poolSeq);
+			s.r[11].assign(reinterpret_cast<char*>(r.addr), r.size);
+		}
+	} else {
+		++g_ppFull;
+		s.r[11].assign(reinterpret_cast<char*>(r.addr), r.size);
+	}
+	s.addr[11] = r.addr;
+	s.size[11] = r.size;
+	s.poolSeq = g_poolSeq;
+	return true;
+}
+bool PoolLoad(const Slot& s, const Region& r) {
+	if (!PoolWatched(r) || s.poolSeq < 0) return false;
+	static std::vector<BYTE> pages;
+	pages.assign(g_poolPages, 0);
+	PoolCollect(pages);
+	if (!PoolSince(s.poolSeq, pages)) return false;
+	++g_ppLoads;
+	g_ppLoadPages += PoolCopyPages(pages, const_cast<std::string&>(s.r[11]), false);
+	if (g_poolCheck && memcmp(s.r[11].data(), r.addr, r.size) != 0) {
+		if (++g_ppMismatch <= 20) Log("POOL: LOAD MISMATCH restoring save %ld; restored whole", s.poolSeq);
+		return false;
+	}
+	return true;
+}
+
 bool SaveSlot(Slot& s, LONG frame) {
 	Region r[kRegions];
 	if (!CurrentRegions(r)) return false;
 	for (int i = 0; i < kRegions; ++i) {
+		if (i == 11 && PoolSave(s, r[i])) continue;
 		s.r[i].assign(reinterpret_cast<char*>(r[i].addr), r[i].size);
 		s.addr[i] = r[i].addr;
 		s.size[i] = r[i].size;
@@ -1186,16 +1332,16 @@ bool SaveSlot(Slot& s, LONG frame) {
 	return true;
 }
 
-bool RollbackKeepsLive(const char*) { return false; }
-
 bool LoadSlot(const Slot& s) {
 	Region r[kRegions];
 	if (!CurrentRegions(r)) return false;
 	for (int i = 0; i < kRegions; ++i)
 		if (r[i].addr != s.addr[i] || r[i].size != s.size[i]) return false;
 	if (!RestoreParticles(s.fx)) return false;
-	for (int i = 0; i < kRegions; ++i)
-		if (!RollbackKeepsLive(r[i].name)) RestoreRegion(r[i], s.r[i]);
+	for (int i = 0; i < kRegions; ++i) {
+		if (i == 11 && PoolLoad(s, r[i])) continue;
+		RestoreRegion(r[i], s.r[i]);
+	}
 	RestoreCtrls(s.ctrl);
 	RestoreSceneFields(s);
 	RestoreUiObjs(s);
@@ -1207,7 +1353,7 @@ bool MatchesSlot(const Slot& s, bool log) {
 	if (!CurrentRegions(r)) return false;
 	bool same = true;
 	for (int i = 0; i < kRegions; ++i) {
-		if (!CompareRegion(r[i].name) || RollbackKeepsLive(r[i].name) || memcmp(r[i].addr, s.r[i].data(), r[i].size) == 0) continue;
+		if (!CompareRegion(r[i].name) || memcmp(r[i].addr, s.r[i].data(), r[i].size) == 0) continue;
 		const bool pool = strcmp(r[i].name, "objpool") == 0;
 		unsigned shown = 0;
 		for (DWORD off = 0; off + 4 <= r[i].size; off += 4) {
@@ -1224,6 +1370,7 @@ bool MatchesSlot(const Slot& s, bool log) {
 	return same;
 }
 
+#ifdef BBCSE_DEV_TOOLS
 void SyncTestFrame(void* self, void* edx) {
 	if (g_ringReset) {
 		for (auto& s : g_ring) s.frame = -1;
@@ -1255,7 +1402,6 @@ void SyncTestFrame(void* self, void* edx) {
 		for (auto& s : g_ring) s.frame = -1;
 		return;
 	}
-
 	auto replay = [&](bool stepCheck) {
 		for (LONG j = back; j < k; ++j) {
 			RestoreCtrls(g_ring[j % kRing].ctrl);
@@ -1296,8 +1442,10 @@ void SyncTestFrame(void* self, void* edx) {
 	g_syncMs += ms;
 	if (ms > g_syncMsMax) g_syncMsMax = ms;
 }
+#endif
 
 constexpr DWORD kD3DCreateIat = 0x9042D0;
+constexpr DWORD kDinputCreateIat = 0x904000;
 constexpr DWORD kLimiterTimer = 0xB8EBA8;
 constexpr DWORD kPresentImmediate = 0x80000000;
 constexpr DWORD kPresentIntervalOff = 0x34;
@@ -1335,8 +1483,8 @@ bool PatchVtableSlot(void* obj, int slot, void* hook, void** orig) {
 bool g_borderless = false;
 HWND g_borderlessWnd = nullptr;
 RECT g_borderlessRect{};
-
 constexpr DWORD kIatSetWindowPos = 0x90425C, kIatSetWindowLongA = 0x904298;
+constexpr DWORD kIatCreateFileA = 0x904098, kIatCreateFileW = 0x90406C;
 constexpr LONG kFrameStyles = WS_OVERLAPPEDWINDOW;
 using SetWindowPos_t = BOOL(WINAPI*)(HWND, HWND, int, int, int, int, UINT);
 using SetWindowLongA_t = LONG(WINAPI*)(HWND, int, LONG);
@@ -1362,6 +1510,131 @@ void PatchIat(DWORD slotVa, void* hook, void** orig) {
 	*orig = *slot;
 	*slot = hook;
 	VirtualProtect(slot, sizeof(void*), old, &old);
+}
+std::string g_versionName = "cse";
+std::string g_versionDir;
+CRITICAL_SECTION g_versionLock;
+std::string g_versionLoaded;
+void NoteVersionLoad(const std::string& path) {
+	const size_t slash = path.find_last_of("\\/");
+	std::string file = slash == std::string::npos ? path : path.substr(slash + 1);
+	for (char& c : file) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+	if (file.compare(0, 5, "char_") != 0 || file.size() < 7) return;
+	const std::string code = file.compare(0, 10, "char_boss_") == 0 ? std::string() : file.substr(5, 2);
+	if (code.empty() || code == "e0") return;
+	EnterCriticalSection(&g_versionLock);
+	if (g_versionLoaded.find(code) == std::string::npos) {
+		if (!g_versionLoaded.empty()) g_versionLoaded += ' ';
+		g_versionLoaded += code;
+	}
+	LeaveCriticalSection(&g_versionLock);
+}
+LONG g_versionRedirects = 0;
+using CreateFileA_t = HANDLE(WINAPI*)(LPCSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
+using CreateFileW_t = HANDLE(WINAPI*)(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
+CreateFileA_t g_origCreateFileA = nullptr;
+CreateFileW_t g_origCreateFileW = nullptr;
+std::string VersionPath(const std::string& path) {
+	EnterCriticalSection(&g_versionLock);
+	const std::string root = g_versionDir;
+	const bool cseOnly = g_versionName == "cse";
+	LeaveCriticalSection(&g_versionLock);
+	if (root.empty() || path.empty()) return std::string();
+	std::string p = path;
+	for (char& c : p)
+		if (c == '/') c = '\\';
+	std::string low = p;
+	for (char& c : low) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+	size_t at = std::string::npos;
+	if (low.compare(0, 5, "data\\") == 0) {
+		at = 5;
+	} else {
+		const size_t k = low.rfind("\\data\\");
+		if (k != std::string::npos) at = k + 6;
+	}
+	if (at == std::string::npos) return std::string();
+	if (cseOnly && low.compare(at, 4, "etc\\") != 0) return std::string();
+	const std::string alt = root + p.substr(at);
+	return GetFileAttributesA(alt.c_str()) == INVALID_FILE_ATTRIBUTES ? std::string() : alt;
+}
+std::string RelPath(const std::string& p) {
+	const std::string dir = ModuleDir(g_self);
+	return _strnicmp(p.c_str(), dir.c_str(), dir.size()) == 0 ? p.substr(dir.size()) : p;
+}
+void NoteMediaOpen(const char* name) {
+#ifdef BBCSE_DEV_TOOLS
+	static LONG s_logged = 0;
+	std::string low = name;
+	for (char& c : low) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+	if ((low.find("bgm") != std::string::npos || low.find("movie") != std::string::npos) && InterlockedIncrement(&s_logged) <= 300)
+		Log("MEDIA: %s", name);
+#else
+	(void)name;
+#endif
+}
+HANDLE WINAPI HookCreateFileA(LPCSTR name, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa, DWORD disp, DWORD flags, HANDLE tmpl) {
+	if (name && !(access & GENERIC_WRITE)) {
+		NoteMediaOpen(name);
+		const std::string alt = VersionPath(name);
+		if (!alt.empty()) {
+			if (g_versionRedirects++ < 200) Log("VERSION: %s -> %s", RelPath(name).c_str(), RelPath(alt).c_str());
+			NoteVersionLoad(name);
+			return g_origCreateFileA(alt.c_str(), access, share, sa, disp, flags, tmpl);
+		}
+	}
+	return g_origCreateFileA(name, access, share, sa, disp, flags, tmpl);
+}
+HANDLE WINAPI HookCreateFileW(LPCWSTR name, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa, DWORD disp, DWORD flags, HANDLE tmpl) {
+	if (name && !(access & GENERIC_WRITE)) {
+		char narrow[MAX_PATH * 2] = {};
+		if (WideCharToMultiByte(CP_ACP, 0, name, -1, narrow, sizeof(narrow), nullptr, nullptr) > 0) {
+			NoteMediaOpen(narrow);
+			const std::string alt = VersionPath(narrow);
+			if (!alt.empty()) {
+				wchar_t wide[MAX_PATH * 2] = {};
+				if (MultiByteToWideChar(CP_ACP, 0, alt.c_str(), -1, wide, MAX_PATH * 2) > 0) {
+					if (g_versionRedirects++ < 200) Log("VERSION: %s -> %s", RelPath(narrow).c_str(), RelPath(alt).c_str());
+					NoteVersionLoad(narrow);
+					return g_origCreateFileW(wide, access, share, sa, disp, flags, tmpl);
+				}
+			}
+		}
+	}
+	return g_origCreateFileW(name, access, share, sa, disp, flags, tmpl);
+}
+void LoadSavedVersion();
+void InstallVersionSelect() {
+	static bool done = false;
+	if (done) return;
+	done = true;
+	InitializeCriticalSection(&g_versionLock);
+	PatchIat(kIatCreateFileA, reinterpret_cast<void*>(&HookCreateFileA), reinterpret_cast<void**>(&g_origCreateFileA));
+	PatchIat(kIatCreateFileW, reinterpret_cast<void*>(&HookCreateFileW), reinterpret_cast<void**>(&g_origCreateFileW));
+	LoadSavedVersion();
+}
+std::string VersionsRoot() { return ModuleDir(g_self) + "bbcse-versions\\"; }
+constexpr DWORD kCatalogBlockFn = 0x453C10;
+constexpr DWORD kRuleOffsets[] = {0xB28, 0xB2C, 0xB30, 0xB34, 0xB44, 0xB38, 0xB3C};
+const char* const kRuleNames[] = {"SafeGuardPrimer", "BarrierRecoverEx", "SafeRendaBarrier", "EtcBBCS2Function", "VoiceUpdateCS2", "JustGuardFrame", "GuardCrushDamageRate"};
+constexpr int kCs1Rules[] = {0, 0, 0, 0, 0, 5, 70};
+constexpr int kCseRules[] = {1, 1, 1, 1, 1, 3, 90};
+constexpr int kRuleCount = static_cast<int>(sizeof(kRuleOffsets) / sizeof(kRuleOffsets[0]));
+bool g_gameRulesSaved = false;
+void ApplyVersionRules() {
+	using CatalogBlock_t = BYTE*(__cdecl*)(int);
+	BYTE* block = reinterpret_cast<CatalogBlock_t>(Live(kCatalogBlockFn))(-1);
+	if (!block) return;
+	g_gameRulesSaved = true;
+	const bool cs1 = g_versionName == "cs1";
+	char line[256] = "";
+	for (int i = 0; i < kRuleCount; ++i) {
+		const int v = cs1 ? kCs1Rules[i] : kCseRules[i];
+		*reinterpret_cast<int*>(block + kRuleOffsets[i]) = v;
+		char part[40];
+		sprintf_s(part, "%s%s %d", i ? ", " : "", kRuleNames[i], v);
+		strcat_s(line, part);
+	}
+	Log("VERSION rules (%s): %s", g_versionName.c_str(), line);
 }
 void MakeBorderless(void* pp) {
 	if (!g_borderless || !pp) return;
@@ -1389,10 +1662,8 @@ HRESULT __stdcall HookReset(void* dev, void* pp) {
 	if (hr >= 0) { Overlay_AfterReset(); MakeBorderless(pp); }
 	return hr;
 }
-
 using Present_t = HRESULT(__stdcall*)(void* dev, const void* src, const void* dst, HWND wnd, const void* dirty);
 Present_t g_origPresent = nullptr;
-
 constexpr double kFramePeriodUs = 1000000.0 / 60.0;
 double g_paceNextUs = 0, g_presentEmaMs = 0;
 int g_presentSamples = 0;
@@ -1403,7 +1674,6 @@ double QpcNowUs() {
 	QueryPerformanceCounter(&t);
 	return static_cast<double>(t.QuadPart) * 1000000.0 / static_cast<double>(f.QuadPart);
 }
-
 enum class Pace { Own, VsyncOnly };
 Pace g_pace = Pace::Own;
 int g_refreshHz = 0;
@@ -1417,9 +1687,7 @@ int RefreshHz() {
 	return EnumDisplaySettingsA(nullptr, ENUM_CURRENT_SETTINGS, &dm) ? static_cast<int>(dm.dmDisplayFrequency) : 60;
 }
 bool OwnPacing() { return g_vsyncWanted && g_pace == Pace::Own; }
-
 bool g_waitAfterPresent = false;
-
 void WaitDeadline() {
 	double now = QpcNowUs();
 	if (g_paceNextUs == 0 || now - g_paceNextUs > kFramePeriodUs) {
@@ -1434,7 +1702,6 @@ void WaitDeadline() {
 	}
 	g_paceNextUs += kFramePeriodUs;
 }
-
 constexpr DWORD kLimiterFn = 0x427E50, kLimiterSiteA = 0x412526, kLimiterSiteB = 0x412665;
 using Limiter_t = int(__fastcall*)(void* timer, void* edx);
 Limiter_t g_origLimiter = nullptr;
@@ -1479,7 +1746,7 @@ void PaceAfterPresent(double presentMs) {
 			g_pace = Pace::VsyncOnly;
 			g_loopLastUs = 0;
 			g_loopSamples = 0;
-			Log("PACING: Present blocks %.1f ms on average: the driver forces VSync (%d Hz). VSync paces alone now",
+			Log("PACING: Present blocks %.1f ms on average: the driver forces VSync (%d Hz). VSync paces alone",
 				g_presentEmaMs, g_refreshHz);
 		} else if (!g_vsyncDetected) {
 			g_vsyncDetected = true;
@@ -1488,7 +1755,74 @@ void PaceAfterPresent(double presentMs) {
 		}
 	}
 }
+RECT g_canvasDst{};
+UINT g_backBufferW = 0, g_backBufferH = 0;
+constexpr DWORD kIatPerspectiveFov = 0x9042F4;
+using PerspectiveFov_t = float*(WINAPI*)(float* out, float fovy, float aspect, float zn, float zf);
+PerspectiveFov_t g_origPerspectiveFov = nullptr;
+float* g_battleProj = nullptr;
+float* WINAPI HookPerspectiveFov(float* out, float fovy, float aspect, float zn, float zf) {
+	if (fabsf(fovy - 0.785f) < 0.01f && fabsf(aspect - 1.667f) < 0.01f) g_battleProj = out;
+	return g_origPerspectiveFov(out, fovy, aspect, zn, zf);
+}
+bool BattleCamera(const float*& view, const float*& proj) {
+	if (!g_battleProj) return false;
+	MEMORY_BASIC_INFORMATION mbi{};
+	const float* v = g_battleProj - 20;
+	if (!VirtualQuery(v, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) == 0)
+		return false;
+	if (static_cast<const BYTE*>(mbi.BaseAddress) + mbi.RegionSize < reinterpret_cast<const BYTE*>(g_battleProj + 16)) return false;
+	const float* p = g_battleProj;
+	if (p[11] != 1.0f || p[15] != 0.0f || v[15] != 1.0f || v[3] != 0.0f || v[7] != 0.0f || v[11] != 0.0f) return false;
+	view = v;
+	proj = p;
+	return true;
+}
+void CollectHitboxScene() {
+	HitboxScene& h = g_hitboxScene;
+	h.valid = false;
+	h.objects.clear();
+	if (!g_hitboxVisible || !BattleCamera(h.view, h.proj) || !g_backBufferW) return;
+	const BYTE* chars = *reinterpret_cast<BYTE**>(Live(kObjMgr) + kCharsPtrOff);
+	if (!chars) return;
+	h.objects.push_back(chars);
+	h.objects.push_back(chars + 0x20140);
+	const BYTE* pool = g_poolMem + kPoolObjOff;
+	h.chars = chars;
+	h.poolBegin = pool;
+	h.poolStride = kPoolStride;
+	h.poolCount = 400;
+	for (DWORD i = 0; i < 400; ++i) {
+		const BYTE* o = pool + i * kPoolStride;
+		if (*reinterpret_cast<const int*>(o + 0x10) == 1 && *reinterpret_cast<void* const*>(o + 0x4C)) h.objects.push_back(o);
+	}
+	h.dstLeft = static_cast<float>(g_canvasDst.left);
+	h.dstTop = static_cast<float>(g_canvasDst.top);
+	h.dstWidth = static_cast<float>(g_canvasDst.right - g_canvasDst.left);
+	h.dstHeight = static_cast<float>(g_canvasDst.bottom - g_canvasDst.top);
+	h.backBufferWidth = static_cast<float>(g_backBufferW);
+	h.backBufferHeight = static_cast<float>(g_backBufferH);
+	h.valid = true;
+}
+void VersionSyncTick();
+void PaletteSyncTick();
 HRESULT __stdcall HookPresent(void* dev, const void* src, const void* dst, HWND wnd, const void* dirty) {
+	VersionSyncTick();
+	PaletteSyncTick();
+	const bool training = *reinterpret_cast<int*>(Live(kGameModeVa)) == kModeTraining;
+	if (g_poolMem && training) {
+		CollectHitboxScene();
+	} else {
+		g_frameAdv.valid = false;
+		g_hitboxScene.valid = false;
+	}
+	g_paletteScene.objMgr = Live(kObjMgr);
+	g_paletteScene.gameInfo = Live(kGameModeVa - 8);
+	g_paletteScene.fileBuffer = Live(0xBBEA50);
+	g_paletteScene.opSizes = Live(0x9EB920);
+	g_paletteScene.training = training;
+	g_paletteScene.valid = g_poolMem && SceneFighting() && *reinterpret_cast<BYTE**>(Live(kObjMgr) + kCharsPtrOff);
+	Palette_Tick();
 	Overlay_OnPresent(static_cast<IDirect3DDevice9*>(dev));
 	const double t0 = QpcNowUs();
 	const HRESULT hr = g_origPresent(dev, src, dst, wnd, dirty);
@@ -1499,7 +1833,6 @@ HRESULT __stdcall HookPresent(void* dev, const void* src, const void* dst, HWND 
 	}
 	return hr;
 }
-
 int g_renderW = 0, g_renderH = 0;
 using CreateRT_t = HRESULT(__stdcall*)(void* dev, UINT w, UINT h, DWORD fmt, DWORD ms, DWORD q, BOOL flag, void** surf, HANDLE* share);
 using SetViewport_t = HRESULT(__stdcall*)(void* dev, const D3DVIEWPORT9* vp);
@@ -1516,7 +1849,6 @@ HRESULT __stdcall HookCreateDS(void* dev, UINT w, UINT h, DWORD fmt, DWORD ms, D
 	if (IsCanvasSize(w, h)) { w = g_renderW; h = g_renderH; }
 	return g_origCreateDS(dev, w, h, fmt, ms, q, discard, surf, share);
 }
-
 bool IsRenderSized(IDirect3DSurface9* surf) {
 	D3DSURFACE_DESC d{};
 	return surf && SUCCEEDED(surf->GetDesc(&d)) && d.Width == static_cast<UINT>(g_renderW) && d.Height == static_cast<UINT>(g_renderH);
@@ -1537,8 +1869,29 @@ HRESULT __stdcall HookSetViewport(void* dev, const D3DVIEWPORT9* vp) {
 	}
 	return g_origSetViewport(dev, vp);
 }
+bool IsCanvasSurface(void* surf) {
+	D3DSURFACE_DESC d{};
+	if (!surf || FAILED(static_cast<IDirect3DSurface9*>(surf)->GetDesc(&d))) return false;
+	return g_renderW > 0 ? d.Width == static_cast<UINT>(g_renderW) && d.Height == static_cast<UINT>(g_renderH)
+	                     : IsCanvasSize(d.Width, d.Height);
+}
+void NoteCanvasCopy(void* dev, void* src, void* dst, const RECT* dstRect) {
+	if (!IsCanvasSurface(src)) return;
+	IDirect3DSurface9* bb = nullptr;
+	if (FAILED(static_cast<IDirect3DDevice9*>(dev)->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb)) || !bb) return;
+	if (bb == dst) {
+		D3DSURFACE_DESC d{};
+		if (SUCCEEDED(bb->GetDesc(&d))) {
+			g_backBufferW = d.Width;
+			g_backBufferH = d.Height;
+			g_canvasDst = dstRect ? *dstRect : RECT{0, 0, static_cast<LONG>(d.Width), static_cast<LONG>(d.Height)};
+		}
+	}
+	bb->Release();
+}
 HRESULT __stdcall HookStretchRect(void* dev, void* src, const RECT* srcRect, void* dst, const RECT* dstRect, DWORD filter) {
-	if (srcRect && srcRect->left == 0 && srcRect->top == 0 && IsCanvasSize(srcRect->right, srcRect->bottom) &&
+	NoteCanvasCopy(dev, src, dst, dstRect);
+	if (g_renderW > 0 && srcRect && srcRect->left == 0 && srcRect->top == 0 && IsCanvasSize(srcRect->right, srcRect->bottom) &&
 	    IsRenderSized(static_cast<IDirect3DSurface9*>(src))) {
 		const RECT r = {0, 0, g_renderW, g_renderH};
 		return g_origStretchRect(dev, src, &r, dst, dstRect, D3DTEXF_LINEAR);
@@ -1547,7 +1900,6 @@ HRESULT __stdcall HookStretchRect(void* dev, void* src, const RECT* srcRect, voi
 }
 void InstallDeviceHooks(void* dev) {
 	if (!dev || g_origPresent) return;
-
 	MEMORY_BASIC_INFORMATION mbi{};
 	void* present = (*reinterpret_cast<void***>(dev))[17];
 	if (!VirtualQuery(present, &mbi, sizeof(mbi)) || mbi.AllocationBase != GetModuleHandleA("d3d9.dll")) {
@@ -1559,10 +1911,10 @@ void InstallDeviceHooks(void* dev) {
 	if (g_renderW > 0 && g_renderH > 0) {
 		PatchVtableSlot(dev, 28, reinterpret_cast<void*>(&HookCreateRT), reinterpret_cast<void**>(&g_origCreateRT));
 		PatchVtableSlot(dev, 29, reinterpret_cast<void*>(&HookCreateDS), reinterpret_cast<void**>(&g_origCreateDS));
-		PatchVtableSlot(dev, 34, reinterpret_cast<void*>(&HookStretchRect), reinterpret_cast<void**>(&g_origStretchRect));
 		PatchVtableSlot(dev, 47, reinterpret_cast<void*>(&HookSetViewport), reinterpret_cast<void**>(&g_origSetViewport));
 		Log("DISPLAY: render size %dx%d (game default 1280x768)", g_renderW, g_renderH);
 	}
+	PatchVtableSlot(dev, 34, reinterpret_cast<void*>(&HookStretchRect), reinterpret_cast<void**>(&g_origStretchRect));
 	Log("overlay: device hooks installed (F1 shows / hides the diagnostics panel in online battles)");
 }
 HRESULT __stdcall HookCreateDevice(void* d3d, UINT adapter, DWORD type, HWND wnd, DWORD flags, void* pp, void** dev) {
@@ -1594,7 +1946,6 @@ bool CloudName(const char* name, std::string& path) {
 bool __fastcall CloudFileWrite(void*, void*, const char* name, const void* data, int size) {
 	std::string path;
 	if (!CloudName(name, path) || size < 0) return false;
-
 	const std::string tmp = path + ".tmp";
 	FILE* f = nullptr;
 	if (fopen_s(&f, tmp.c_str(), "wb") != 0 || !f) { Log("CLOUD: write %s FAILED", name); return false; }
@@ -1648,7 +1999,7 @@ bool __fastcall CloudGetQuota(void*, void*, int* total, int* available) {
 }
 bool __fastcall CloudEnabled(void*, void*) { return true; }
 
-void ImportSteamCloudCopy(void* storage) {
+void ImportSteamCloudCopy(void*) {
 	std::string local;
 	if (!CloudName("DCARD.UMS", local) || GetFileAttributesA(local.c_str()) != INVALID_FILE_ATTRIBUTES) return;
 	char steamPath[MAX_PATH] = {};
@@ -1664,9 +2015,8 @@ void ImportSteamCloudCopy(void* storage) {
 	(*reinterpret_cast<GetSteamID_t*>(*reinterpret_cast<BYTE**>(user) + 8))(user, nullptr, &id);
 	char src[MAX_PATH];
 	sprintf_s(src, "%s\\userdata\\%lu\\%lu\\remote\\DCARD.UMS", steamPath, static_cast<unsigned long>(id & 0xFFFFFFFF), kAppId);
-	if (CopyFileA(src, local.c_str(), TRUE)) Log("CLOUD: imported your old online profile from %s", src);
-	else Log("CLOUD: no old online profile at %s (a new one will be made)", src);
-	(void)storage;
+	if (CopyFileA(src, local.c_str(), TRUE)) Log("CLOUD: imported the old online profile from Steam userdata");
+	else Log("CLOUD: no old online profile in Steam userdata (a new one will be made)");
 }
 
 void PatchCloudSlot(void** vt, int slot, void* fn) {
@@ -1692,7 +2042,7 @@ void* __cdecl HookSteamRemoteStorage() {
 		PatchCloudSlot(vt, 19, reinterpret_cast<void*>(&CloudEnabled));
 		CreateDirectoryA(g_cloudDir.c_str(), nullptr);
 		ImportSteamCloudCopy(storage);
-		Log("CLOUD: online profile kept in %s (Steam Cloud is off for this game)", g_cloudDir.c_str());
+		Log("CLOUD: online profile kept in bbcse-cloud (Steam Cloud is off for this game)");
 	}
 	return storage;
 }
@@ -1715,12 +2065,13 @@ void InstallVsyncOff(HMODULE self) {
 	const std::string ini = ModuleDir(self) + "bbcse-net.ini";
 	char mode[16] = {};
 	GetPrivateProfileStringA("net", "mode", "", mode, sizeof(mode), ini.c_str());
-	if (_stricmp(mode, "steam") != 0 || GetPrivateProfileIntA("net", "vsync", 0, ini.c_str()) != 0) return;
-	g_vsyncWanted = true;
-	g_renderW = GetPrivateProfileIntA("display", "renderwidth", 0, ini.c_str());
-	g_renderH = GetPrivateProfileIntA("display", "renderheight", 0, ini.c_str());
-	g_borderless = GetPrivateProfileIntA("display", "borderless", 0, ini.c_str()) != 0;
-	if (g_renderW < 320 || g_renderH < 192 || g_renderW > 8192 || g_renderH > 8192) g_renderW = g_renderH = 0;
+	if (_stricmp(mode, "steam") == 0) {
+		g_vsyncWanted = GetPrivateProfileIntA("net", "vsync", 0, ini.c_str()) == 0;
+		g_renderW = GetPrivateProfileIntA("display", "renderwidth", 0, ini.c_str());
+		g_renderH = GetPrivateProfileIntA("display", "renderheight", 0, ini.c_str());
+		g_borderless = GetPrivateProfileIntA("display", "borderless", 0, ini.c_str()) != 0;
+		if (g_renderW < 320 || g_renderH < 192 || g_renderW > 8192 || g_renderH > 8192) g_renderW = g_renderH = 0;
+	}
 	BYTE* base = reinterpret_cast<BYTE*>(GetModuleHandleA(nullptr));
 	void** slot = reinterpret_cast<void**>(base + (kD3DCreateIat - kImage));
 	HMODULE d3d9 = GetModuleHandleA("d3d9.dll");
@@ -1734,7 +2085,9 @@ void InstallVsyncOff(HMODULE self) {
 	g_origD3DCreate = reinterpret_cast<D3DCreate_t>(real);
 	*slot = reinterpret_cast<void*>(&HookD3DCreate);
 	VirtualProtect(slot, sizeof(void*), old, &old);
-	Log("VSYNC: display creation hooked; VSync off, the mod paces frames at 60 (vsync=1 in bbcse-net.ini keeps VSync)");
+	Log("VSYNC: display creation hooked; %s", g_vsyncWanted
+		? "VSync off, the mod paces frames at 60 (vsync=1 in bbcse-net.ini keeps VSync)"
+		: "VSync on, the game paces (G-Sync / the display syncs); [display] settings still apply");
 }
 
 double g_paceOutstandingMs = 0, g_paceRiftEma = 0, g_paceAppliedMs = 0;
@@ -1753,7 +2106,6 @@ void PaceOnRecommendation(int framesAhead) {
 void PaceOnPredictionStall() { g_paceHold = 45; }
 void PaceOnRiftSample(int localBehind, int remoteBehind) {
 	if (g_paceHold > 0) { --g_paceHold; return; }
-
 	if (localBehind < -30 || localBehind > 30 || remoteBehind < -30 || remoteBehind > 30) return;
 	const double rift = (remoteBehind - localBehind) * 0.5;
 	g_paceRiftEma = g_paceHasRift ? g_paceRiftEma + (rift - g_paceRiftEma) / 15.0 : rift;
@@ -1763,7 +2115,6 @@ void PaceOnRiftSample(int localBehind, int remoteBehind) {
 		if (g_paceOutstandingMs > 2 * kPaceMaxStepMs * 3) g_paceOutstandingMs = 2 * kPaceMaxStepMs * 3;
 	}
 }
-
 void PaceApply() {
 	if (g_paceOutstandingMs < kPaceMinShiftMs) return;
 	if (g_vsyncWanted && g_pace == Pace::VsyncOnly) {
@@ -1785,7 +2136,6 @@ void PaceApply() {
 	BYTE* clock = *reinterpret_cast<BYTE**>(Live(kLimiterTimer));
 	if (!clock) return;
 	const double ms = g_paceOutstandingMs < kPaceMaxStepMs ? g_paceOutstandingMs : kPaceMaxStepMs;
-
 	using Elapsed_t = unsigned long long(__fastcall*)(BYTE* clock);
 	const unsigned long long elapsedUs = reinterpret_cast<Elapsed_t>(Live(0x407CC0))(clock);
 	if (elapsedUs < static_cast<unsigned long long>((ms + 1.0) * 1000.0)) return;
@@ -1808,7 +2158,6 @@ struct NetState {
 	void* scene = nullptr;
 } g_net;
 bool g_netActive = false;
-
 bool g_spectating = false;
 LONG g_specRngFixes = 0;
 int g_specBase = 0, g_specRound = -1, g_specIdx = -1;
@@ -1817,7 +2166,6 @@ void ReplaySync();
 int g_replayFrame = 0;
 DWORD g_netIn[2];
 bool g_netInUpdate = false;
-
 DWORD g_latPrevPad = 0, g_latPendingMask = 0;
 int g_latPendingFrame = -1;
 LONG g_latSum = 0, g_latCount = 0, g_latMax = 0;
@@ -1886,7 +2234,8 @@ int NetChecksum() {
 
 constexpr int kSyncEvery = 30, kSyncRing = 64;
 constexpr DWORD kHpOff = 0x95C;
-struct SyncMark { int frame = -1; DWORD hash = 0; int hp[2] = {}; };
+struct HashParts { DWORD v[7] = {}; };
+struct SyncMark { int frame = -1; DWORD hash = 0; int hp[2] = {}; HashParts parts; };
 SyncMark g_syncMarks[kSyncRing];
 int g_nextSyncLog = kSyncEvery;
 
@@ -1897,12 +2246,30 @@ DWORD CrossPcHash() {
 	const BYTE* chars = r[1].addr;
 	h ^= (*reinterpret_cast<const DWORD*>(chars + kHpOff) * 2654435761u) ^
 	     (*reinterpret_cast<const DWORD*>(chars + 0x20140 + kHpOff) * 40503u);
-
 	const BYTE* mgr = r[0].addr;
 	const DWORD extra[] = {*reinterpret_cast<const DWORD*>(chars + 0x248), *reinterpret_cast<const DWORD*>(chars + 0x24C),
 	                       *reinterpret_cast<const DWORD*>(chars + 0x20140 + 0x248), *reinterpret_cast<const DWORD*>(chars + 0x20140 + 0x24C),
 	                       *reinterpret_cast<const DWORD*>(mgr + 0x63698), *reinterpret_cast<const DWORD*>(mgr + 0x62680)};
 	return h ^ FastHash(extra, sizeof(extra)) * 31u;
+}
+HashParts CrossPcParts() {
+	HashParts p;
+	Region r[kRegions];
+	if (!CurrentRegions(r)) return p;
+	const BYTE* chars = r[1].addr;
+	const BYTE* mgr = r[0].addr;
+	p.v[0] = FastHash(r[15].addr, 0x9C4);
+	for (int i = 0; i < 4; ++i)
+		p.v[1 + i] = *reinterpret_cast<const DWORD*>(chars + (i / 2) * 0x20140 + 0x248 + (i % 2) * 4);
+	p.v[5] = *reinterpret_cast<const DWORD*>(mgr + 0x63698);
+	p.v[6] = *reinterpret_cast<const DWORD*>(mgr + 0x62680);
+	return p;
+}
+std::string PartsText(const HashParts& p) {
+	char b[128];
+	sprintf_s(b, " | rng %08lX pos %ld,%ld %ld,%ld mgr %lX %lX", p.v[0], static_cast<long>(p.v[1]), static_cast<long>(p.v[2]),
+	          static_cast<long>(p.v[3]), static_cast<long>(p.v[4]), p.v[5], p.v[6]);
+	return b;
 }
 
 constexpr int kSnapRing = 16;
@@ -1914,6 +2281,7 @@ void MarkSyncFrame() {
 	SyncMark& m = g_syncMarks[(g_net.frame / kSyncEvery) % kSyncRing];
 	m.frame = g_net.frame;
 	m.hash = CrossPcHash();
+	m.parts = CrossPcParts();
 	{
 		Region r[kRegions];
 		SyncSnap& sn = g_syncSnaps[(g_net.frame / kSyncEvery) % kSnapRing];
@@ -1938,7 +2306,7 @@ void LogConfirmedSync() {
 	while (g_nextSyncLog <= confirmed && g_nextSyncLog <= g_net.frame) {
 		const SyncMark& m = g_syncMarks[(g_nextSyncLog / kSyncEvery) % kSyncRing];
 		if (m.frame == g_nextSyncLog) {
-			Log("SYNC frame %d hash %08lX hp %d %d", m.frame, m.hash, m.hp[0], m.hp[1]);
+			Log("SYNC frame %d hash %08lX hp %d %d%s", m.frame, m.hash, m.hp[0], m.hp[1], PartsText(m.parts).c_str());
 			SendSyncHash(m.frame, m.hash);
 		}
 		g_nextSyncLog += kSyncEvery;
@@ -1956,9 +2324,21 @@ bool __cdecl NetSave(unsigned char** buf, int* len, int* checksum, int frame) {
 	*checksum = NetChecksum();
 	return true;
 }
-
 int g_rbFromFrame = -1, g_rbShownHash = 0, g_rbDepth = 0;
 LONG g_rbCount = 0, g_rbChanged = 0, g_rbChangedDepthMax = 0, g_rbChangedDepthSum = 0;
+LONG g_rbDepthMaxSec = 0;
+constexpr DWORD kPosXOff = 0x248, kPosYOff = 0x24C, kCharStrideOff = 0x20140;
+int g_rbShownPos[2][2] = {};
+LONG g_jumps = 0, g_jumpMaxPx = 0, g_jumpsLogged = 0;
+bool ReadFighterPos(int out[2][2]) {
+	const BYTE* chars = *reinterpret_cast<BYTE**>(Live(kObjMgr) + kCharsPtrOff);
+	if (!chars) return false;
+	for (int c = 0; c < 2; ++c) {
+		out[c][0] = *reinterpret_cast<const int*>(chars + c * kCharStrideOff + kPosXOff);
+		out[c][1] = *reinterpret_cast<const int*>(chars + c * kCharStrideOff + kPosYOff);
+	}
+	return true;
+}
 bool __cdecl NetLoad(unsigned char* buf, int) {
 	struct Add { double t0; ~Add() { g_msLoad += NowMs() - t0; } } add{NowMs()};
 	if (!buf) { Log("NET: load of an empty state (save had failed). Desync likely."); return false; }
@@ -1966,7 +2346,9 @@ bool __cdecl NetLoad(unsigned char* buf, int) {
 	if (g_rbFromFrame < 0 && s->frame < g_net.frame) {
 		g_rbFromFrame = g_net.frame;
 		g_rbDepth = g_net.frame - s->frame;
+		if (g_rbDepth > g_rbDepthMaxSec) g_rbDepthMaxSec = g_rbDepth;
 		g_rbShownHash = NetChecksum();
+		ReadFighterPos(g_rbShownPos);
 	}
 	if (!LoadSlot(*s)) { Log("NET: load FAILED (frame %ld): regions moved. Desync likely.", s->frame); return false; }
 	g_net.frame = s->frame;
@@ -2006,6 +2388,24 @@ bool __cdecl NetAdvance(int) {
 			g_rbChangedDepthSum += g_rbDepth;
 			if (g_rbDepth > g_rbChangedDepthMax) g_rbChangedDepthMax = g_rbDepth;
 		}
+		int now[2][2];
+		if (ReadFighterPos(now)) {
+			int px[2][2], worst = 0;
+			for (int c = 0; c < 2; ++c)
+				for (int k = 0; k < 2; ++k) {
+					px[c][k] = (now[c][k] - g_rbShownPos[c][k]) / 1000;
+					worst = (std::max)(worst, std::abs(px[c][k]));
+				}
+			if (worst > 0) {
+				++g_jumps;
+				if (worst > g_jumpMaxPx) g_jumpMaxPx = worst;
+				if (worst >= 8 && g_jumpsLogged < 300) {
+					++g_jumpsLogged;
+					Log("NET JUMP frame %d, %d frames deep: P1 moved %+d,%+d px, P2 moved %+d,%+d px", g_net.frame,
+					    g_rbDepth, px[0][0], px[0][1], px[1][0], px[1][1]);
+				}
+			}
+		}
 		g_rbFromFrame = -1;
 	}
 	ggpo_advance_frame(g_net.session);
@@ -2033,10 +2433,20 @@ constexpr DWORD kNetFetchSite = 0x56F1CC, kNetFetchFn = 0x56E970;
 constexpr DWORD kLocalSlotOff = 0x5958;
 constexpr int kSteamChannel = 1;
 
+struct P2PState {
+	BYTE active, connecting, error, relay;
+	int bytesQueued, packetsQueued;
+	DWORD remoteIp;
+	WORD remotePort;
+};
 struct ISteamNet {
 	virtual bool Send(unsigned long long to, const void* data, unsigned len, int type, int channel) = 0;
 	virtual bool Available(unsigned* len, int channel) = 0;
 	virtual bool Read(void* dst, unsigned cap, unsigned* len, unsigned long long* from, int channel) = 0;
+	virtual bool AcceptSession(unsigned long long who) = 0;
+	virtual bool CloseSession(unsigned long long who) = 0;
+	virtual bool CloseChannel(unsigned long long who, int channel) = 0;
+	virtual bool SessionState(unsigned long long who, P2PState* state) = 0;
 };
 ISteamNet* g_steamNet = nullptr;
 unsigned long long g_steamPeer = 0;
@@ -2044,12 +2454,13 @@ DWORD g_netStartTick = 0;
 bool g_netRealAdvance = false;
 
 int __cdecl SteamSend(const char* buf, int len) {
-	return g_steamNet->Send(g_steamPeer, buf, static_cast<unsigned>(len), 0 , kSteamChannel) ? len : 0;
+	return g_steamNet->Send(g_steamPeer, buf, static_cast<unsigned>(len), 0, kSteamChannel) ? len : 0;
 }
-
+#ifdef BBCSE_DEV_TOOLS
 DWORD g_fakeLagMs = 0;
 struct HeldPacket { DWORD due; std::string data; };
 std::vector<HeldPacket> g_heldPackets;
+#endif
 
 int SteamRecvNow(char* buf, int cap) {
 	unsigned size = 0, got = 0;
@@ -2061,6 +2472,9 @@ int SteamRecvNow(char* buf, int cap) {
 	return 0;
 }
 int __cdecl SteamRecv(char* buf, int cap) {
+#ifndef BBCSE_DEV_TOOLS
+	return SteamRecvNow(buf, cap);
+#else
 	if (!g_fakeLagMs) return SteamRecvNow(buf, cap);
 	int got;
 	while ((got = SteamRecvNow(buf, cap)) > 0) g_heldPackets.push_back({GetTickCount() + g_fakeLagMs, std::string(buf, got)});
@@ -2070,6 +2484,7 @@ int __cdecl SteamRecv(char* buf, int cap) {
 	memcpy(buf, d.data(), n);
 	g_heldPackets.erase(g_heldPackets.begin());
 	return n;
+#endif
 }
 
 bool SteamMode() { return g_net.session && g_net.steam; }
@@ -2092,7 +2507,6 @@ void* __fastcall HookNetWait(void* self, void* edx, int arg) {
 	*reinterpret_cast<int*>(ns + 0x18) = 0;
 	return self;
 }
-
 void AskForMissingInputs() {
 	static WORD lastCount[2] = {0xFFFF, 0xFFFF};
 	static int stale[2] = {};
@@ -2129,17 +2543,13 @@ int AppliedInputWord(int side) {
 void* g_netSendSelf = nullptr;
 int __fastcall HookNetSend(void* self, void* edx, unsigned side, unsigned input) {
 	g_netSendSelf = self;
-
 	if (SteamMode() && !g_netRealAdvance) return 1;
-
 	if (SteamMode() && side < 2) {
 		const int word = AppliedInputWord(static_cast<int>(side));
 		if (word >= 0) input = static_cast<unsigned>(word);
-
 		BYTE* ses = Live(kNetSession);
 		WORD* count = reinterpret_cast<WORD*>(ses + 0x160 + (side + 36000 + ses[0x11AAA] * 2u) * 2);
 		const WORD index = *reinterpret_cast<WORD*>(ses + 0x11AB2);
-
 		if (static_cast<int>(side) == g_net.side && *count != index) {
 			static int logged = 0;
 			if (logged++ < 4) Log("NET: input slot %u realigned to frame index %u (side %u)", *count, index, side);
@@ -2150,7 +2560,6 @@ int __fastcall HookNetSend(void* self, void* edx, unsigned side, unsigned input)
 	if (SteamMode() && static_cast<int>(side) == g_net.side) AskForMissingInputs();
 	return sent;
 }
-
 constexpr DWORD kNetIndexSite = 0x56F75E, kNetIndexFn = 0x45F9B0;
 using NetIndex_t = void(__fastcall*)(void* netstate, void* edx);
 NetIndex_t g_origNetIndex = nullptr;
@@ -2158,15 +2567,43 @@ void __fastcall HookNetIndex(void* netstate, void* edx) {
 	if (SteamMode() && !g_netRealAdvance) return;
 	g_origNetIndex(netstate, edx);
 }
-
 constexpr DWORD kNetInputMsgSite = 0x4691A3, kNetInputMsgFn = 0x45FF50;
 constexpr DWORD kNetRelayMsgSite = 0x4691E0, kNetRelayMsgFn = 0x4603E0;
+constexpr DWORD kNetRelayReplySite = 0x4691BE, kNetRelayReplyFn = 0x4602A0;
+constexpr DWORD kNetResendSite = 0x4691CF, kNetResendFn = 0x460030;
+constexpr WORD kNetBufFrames = 9000;
 using NetMsg_t = void(__fastcall*)(void* self, void* edx, void* msg, void* ctx);
 NetMsg_t g_origNetInputMsg = nullptr;
 NetMsg_t g_origNetRelayMsg = nullptr;
-
+NetMsg_t g_origNetRelayReply = nullptr;
+NetMsg_t g_origNetResend = nullptr;
+LONG g_netMsgDropped = 0;
+bool NetMsgFramesOk(void* msg, BYTE maxCount) {
+	BYTE* m = static_cast<BYTE*>(msg);
+	const WORD frame = *reinterpret_cast<const WORD*>(m + 4);
+	if (frame >= kNetBufFrames || m[8] > maxCount) {
+		if (g_netMsgDropped++ < 4) Log("NET: dropped message %02X (frame %u, count %u)", m[2], frame, m[8]);
+		return false;
+	}
+	if (m[8] > frame) m[8] = static_cast<BYTE>(frame);
+	return true;
+}
+void __fastcall HookNetRelayReply(void* self, void* edx, void* msg, void* ctx) {
+	if (NetMsgFramesOk(msg, 40)) g_origNetRelayReply(self, edx, msg, ctx);
+}
+void __fastcall HookNetResend(void* self, void* edx, void* msg, void* ctx) {
+	const BYTE* m = static_cast<const BYTE*>(msg);
+	const WORD frame = *reinterpret_cast<const WORD*>(m + 4);
+	const WORD side = *reinterpret_cast<const WORD*>(m + 6);
+	if (side > 1 || frame >= kNetBufFrames) {
+		if (g_netMsgDropped++ < 4) Log("NET: dropped message 2B (frame %u, side %u)", frame, side);
+		return;
+	}
+	g_origNetResend(self, edx, msg, ctx);
+}
 DWORD g_netInputGraceUntil = 0;
 void __fastcall HookNetInputMsg(void* self, void* edx, void* msg, void* ctx) {
+	if (static_cast<const BYTE*>(msg)[7] > 1 || !NetMsgFramesOk(msg, 20)) return;
 	if (!SteamMode() && static_cast<LONG>(GetTickCount() - g_netInputGraceUntil) > 0)
 		return g_origNetInputMsg(self, edx, msg, ctx);
 	BYTE* ses = Live(kNetSession);
@@ -2195,7 +2632,6 @@ void __fastcall HookNetRelayMsg(void* self, void* edx, void* msg, void* ctx) {
 	g_origNetRelayMsg(self, edx, msg, ctx);
 	for (int i = 0; i < 4; ++i) count[i] = keep[i];
 }
-
 void LogNetCounters(const char* who) {
 	BYTE* ses = Live(kNetSession);
 	BYTE* self = *reinterpret_cast<BYTE**>(ses + 0x12040);
@@ -2220,6 +2656,7 @@ unsigned __fastcall HookNetFetch(void* self, void* edx, int slot) {
 	return g_origNetFetch(self, edx, slot);
 }
 
+void SendVersionTag();
 bool StartSteamSession(GGPOSessionCallbacks& cb, int delay) {
 	if (*reinterpret_cast<int*>(Live(kGameMgr) + 8) != 4) { Log("NET: not an online battle; rollback off"); return false; }
 	BYTE* self = *reinterpret_cast<BYTE**>(Live(kNetSession) + 0x12040);
@@ -2236,7 +2673,9 @@ bool StartSteamSession(GGPOSessionCallbacks& cb, int delay) {
 	if (!g_steamNet || !g_steamPeer) { Log("NET: Steam networking unavailable; rollback off"); return false; }
 	char drain[1500];
 	while (SteamRecv(drain, sizeof(drain)) > 0) {}
+#ifdef BBCSE_DEV_TOOLS
 	g_heldPackets.clear();
+#endif
 
 	srand(GetTickCount() ^ GetCurrentProcessId());
 	ggpo_bb_send = SteamSend;
@@ -2269,8 +2708,8 @@ bool StartSteamSession(GGPOSessionCallbacks& cb, int delay) {
 	g_netDelay = delay;
 	g_net.steam = true;
 	g_netStartTick = GetTickCount();
-	Log("NET: Steam session: I am side %d, opponent %08lX%08lX, delay %d", g_net.side,
-		static_cast<DWORD>(g_steamPeer >> 32), static_cast<DWORD>(g_steamPeer), delay);
+	Log("NET: Steam session: I am side %d, delay %d", g_net.side, delay);
+	SendVersionTag();
 	return true;
 }
 
@@ -2330,8 +2769,8 @@ int g_lastMatched = -1;
 
 void SendSyncHash(int frame, DWORD hash) {
 	if (!g_net.steam || !g_steamNet) return;
-	const DWORD msg[3] = {0x48535942 , static_cast<DWORD>(frame), hash};
-	g_steamNet->Send(g_steamPeer, msg, sizeof(msg), 2 , kHashChannel);
+	const DWORD msg[3] = {0x48535942, static_cast<DWORD>(frame), hash};
+	g_steamNet->Send(g_steamPeer, msg, sizeof(msg), 2, kHashChannel);
 }
 
 void DesyncDump(int frame, DWORD mine, DWORD theirs) {
@@ -2340,13 +2779,13 @@ void DesyncDump(int frame, DWORD mine, DWORD theirs) {
 	g_ovl.desyncFrame = frame;
 	if (sn.frame != frame) { Log("  (no state copy kept for that frame any more)"); return; }
 	char path[MAX_PATH];
-	GetModuleFileNameA(GetModuleHandleA("dinput8.dll"), path, MAX_PATH);
+	GetModuleFileNameA(g_self, path, MAX_PATH);
 	char* slash = strrchr(path, '\\');
 	*(slash ? slash + 1 : path) = 0;
 	strcat_s(path, "bbcse-desync.bin");
 	FILE* f = nullptr;
-	if (fopen_s(&f, path, "wb") != 0 || !f) { Log("  could not write %s", path); return; }
-	const DWORD hdr[3] = {0x53444242 , static_cast<DWORD>(frame), static_cast<DWORD>(g_net.side)};
+	if (fopen_s(&f, path, "wb") != 0 || !f) { Log("  could not write bbcse-desync.bin"); return; }
+	const DWORD hdr[3] = {0x53444242, static_cast<DWORD>(frame), static_cast<DWORD>(g_net.side)};
 	fwrite(hdr, 4, 3, f);
 	const char* names[2] = {"objmgr", "chars"};
 	for (int i = 0; i < 2; ++i) {
@@ -2360,9 +2799,29 @@ void DesyncDump(int frame, DWORD mine, DWORD theirs) {
 		fwrite(sn.data[i].data(), 1, size, f);
 	}
 	fclose(f);
-	Log("  state of frame %d written to %s (send this file)", frame, path);
+	Log("  state of frame %d written to bbcse-desync.bin (send this file)", frame);
 }
 
+constexpr DWORD kVersionTag = 0x52565942;
+void SendVersionTag() {
+	if (!g_steamNet || !g_steamPeer) return;
+	DWORD msg[3] = {kVersionTag, 0, 0};
+	memcpy(&msg[1], g_versionName.c_str(), (std::min)(g_versionName.size(), static_cast<size_t>(8)));
+	g_steamNet->Send(g_steamPeer, msg, sizeof(msg), 2, kHashChannel);
+	strcpy_s(g_ovl.version, g_versionName.c_str());
+	g_ovl.peerVersion[0] = 0;
+	g_ovl.versionMismatch = false;
+}
+void NotePeerVersion(const DWORD* msg) {
+	char peer[9] = {};
+	memcpy(peer, &msg[1], 8);
+	for (char& c : peer)
+		if (c && (static_cast<unsigned char>(c) < 32 || c == 127)) c = '?';
+	if (strcmp(g_ovl.peerVersion, peer) == 0) return;
+	strcpy_s(g_ovl.peerVersion, peer);
+	g_ovl.versionMismatch = g_versionName != peer;
+	Log("VERSION: opponent plays %s, this PC %s%s", peer, g_versionName.c_str(), g_ovl.versionMismatch ? "  MISMATCH: the match will desync" : "");
+}
 void PumpSyncHashes() {
 	if (!g_net.steam || !g_steamNet) return;
 	unsigned size = 0, got = 0;
@@ -2370,6 +2829,10 @@ void PumpSyncHashes() {
 	DWORD msg[3];
 	while (g_steamNet->Available(&size, kHashChannel)) {
 		if (!g_steamNet->Read(msg, sizeof(msg), &got, &from, kHashChannel)) break;
+		if (from == g_steamPeer && got == sizeof(msg) && msg[0] == kVersionTag) {
+			NotePeerVersion(msg);
+			continue;
+		}
 		if (from != g_steamPeer || got != sizeof(msg) || msg[0] != 0x48535942) continue;
 		PeerHash& ph = g_peerHashes[(msg[1] / kSyncEvery) % kSyncRing];
 		ph.frame = static_cast<int>(msg[1]);
@@ -2415,32 +2878,43 @@ void NetStop() {
 	Log("NET: session closed");
 }
 
+void ApplyVersionRules();
 void NetBattleStart() {
 	NetStop();
+	EnterCriticalSection(&g_versionLock);
+	g_versionLoaded.clear();
+	LeaveCriticalSection(&g_versionLock);
+	if (g_versionName != "cse" || g_gameRulesSaved) ApplyVersionRules();
 	g_spectating = false;
 	g_replayFrame = 0;
 	g_specBase = 0;
 	g_specRound = g_specIdx = -1;
 	g_steamRearm = false;
 	char ini[MAX_PATH];
-	GetModuleFileNameA(GetModuleHandleA("dinput8.dll"), ini, MAX_PATH);
+	GetModuleFileNameA(g_self, ini, MAX_PATH);
 	char* slash = strrchr(ini, '\\');
 	*(slash ? slash + 1 : ini) = 0;
 	strcat_s(ini, "bbcse-net.ini");
 	if (GetFileAttributesA(ini) == INVALID_FILE_ATTRIBUTES) return;
-	char mode[16], remote[64];
+	char mode[16];
 	GetPrivateProfileStringA("net", "mode", "", mode, sizeof(mode), ini);
-	g_net.synctest = _stricmp(mode, "synctest") == 0;
 	const bool steam = _stricmp(mode, "steam") == 0;
-	if (!g_net.synctest && !steam && _stricmp(mode, "p2p") != 0) { Log("NET: %s has no mode=steam/p2p/synctest; network off", ini); return; }
+	const int delay = GetPrivateProfileIntA("net", "delay", 2, ini);
+#ifdef BBCSE_DEV_TOOLS
+	char remote[64];
+	g_heldPackets.clear();
+	g_net.synctest = _stricmp(mode, "synctest") == 0;
+	if (!g_net.synctest && !steam && _stricmp(mode, "p2p") != 0) { Log("NET: bbcse-net.ini has no mode=steam/p2p/synctest; network off"); return; }
 	g_net.side = GetPrivateProfileIntA("net", "side", 0, ini) ? 1 : 0;
 	g_fakeLagMs = static_cast<DWORD>(GetPrivateProfileIntA("net", "fakelag", 0, ini));
-	g_heldPackets.clear();
-	if (g_fakeLagMs) Log("NET: fakelag %lu ms (test aid: packets from the peer are held back)", g_fakeLagMs);
+	if (g_fakeLagMs) Log("NET: fakelag %lu ms", g_fakeLagMs);
 	g_net.seed = static_cast<DWORD>(GetPrivateProfileIntA("net", "seed", 12345, ini));
 	const int port = GetPrivateProfileIntA("net", "localport", 7000, ini);
-	const int delay = GetPrivateProfileIntA("net", "delay", 2, ini);
+	g_poolCheck = GetPrivateProfileIntA("net", "savecheck", 0, ini) != 0;
 	GetPrivateProfileStringA("net", "remote", "", remote, sizeof(remote), ini);
+#else
+	if (!steam) { Log("NET: bbcse-net.ini has no mode=steam; network off"); return; }
+#endif
 
 	GGPOSessionCallbacks cb{};
 	cb.begin_game = NetBeginGame;
@@ -2459,7 +2933,9 @@ void NetBattleStart() {
 	them.player_num = 2 - g_net.side;
 	if (steam) {
 		if (!StartSteamSession(cb, delay)) { g_net = NetState(); return; }
-	} else if (g_net.synctest) {
+	}
+#ifdef BBCSE_DEV_TOOLS
+	else if (g_net.synctest) {
 		ggpo_start_synctest(&g_net.session, &cb, game, 2, sizeof(DWORD), 7);
 		ggpo_add_player(g_net.session, &me, &g_net.local);
 		ggpo_add_player(g_net.session, &them, &g_net.remote);
@@ -2486,6 +2962,7 @@ void NetBattleStart() {
 		ggpo_set_frame_delay(g_net.session, g_net.local, delay);
 		Log("NET: p2p session: I am side %d on port %d, peer %s:%s, delay %d", g_net.side, port, remote, colon + 1, delay);
 	}
+#endif
 	for (auto& m : g_syncMarks) m = SyncMark();
 	for (auto& ph : g_peerHashes) ph = PeerHash();
 	g_desyncDumped = false;
@@ -2565,7 +3042,6 @@ void NetTick(void* self, void* edx, int arg) {
 			PaceOnRiftSample(st.timesync.local_frames_behind, st.timesync.remote_frames_behind);
 	}
 	bool advance = false;
-
 	static int s_stallGap = 0;
 	if (s_stallGap > 0) --s_stallGap;
 	if ((g_net.stall > 0 || g_paceHoldRequests > 0) && s_stallGap == 0) {
@@ -2662,7 +3138,8 @@ void NetTick(void* self, void* edx, int arg) {
 			g_ovl.updatesPerSec = static_cast<float>(g_net.frame - s_frameBefore) * 1000.0f / static_cast<float>(now - g_lastReport);
 			s_frameBefore = g_net.frame;
 			g_ovl.rollbackFramesPerSec = g_netRollbackFrames;
-			g_ovl.rollbackMaxDepth = g_ovlMaxDepth;
+			g_ovl.rollbackMaxDepth = g_rbDepthMaxSec;
+			g_rbDepthMaxSec = 0;
 			g_ovlMaxDepth = 0;
 			g_ovl.aheadFrames = static_cast<float>(g_paceRiftEma);
 			g_ovl.pacedMsPerSec = static_cast<float>(g_paceAppliedMs);
@@ -2690,6 +3167,14 @@ void NetTick(void* self, void* edx, int arg) {
 			g_paceRiftEma, g_paceAppliedMs, g_vsyncForcedOff ? "off" : "on");
 		Log("NET 1s: %ld rollbacks, %ld changed what was on screen (avg %.1f, max %ld frames deep)", g_rbCount, g_rbChanged,
 			g_rbChanged ? static_cast<double>(g_rbChangedDepthSum) / g_rbChanged : 0.0, g_rbChangedDepthMax);
+		Log("NET 1s: %ld rollbacks moved a fighter on screen (largest jump %ld px)", g_jumps, g_jumpMaxPx);
+		if (g_ppSaves || g_ppLoads)
+			Log("POOL 1s: %ld saves (%ld whole), %.1f of %lu pages per save; %ld loads, %.1f pages per load; %ld mismatches%s",
+			    g_ppSaves, g_ppFull, g_ppSaves > g_ppFull ? static_cast<double>(g_ppPages) / (g_ppSaves - g_ppFull) : 0.0,
+			    g_poolPages, g_ppLoads, g_ppLoads ? static_cast<double>(g_ppLoadPages) / g_ppLoads : 0.0, g_ppMismatch,
+			    g_poolCheck ? " (savecheck on)" : "");
+		g_ppSaves = g_ppFull = g_ppPages = g_ppLoads = g_ppLoadPages = 0;
+		g_jumps = g_jumpMaxPx = 0;
 		g_rbCount = g_rbChanged = g_rbChangedDepthSum = g_rbChangedDepthMax = 0;
 		if (g_net.steam) LogNetCounters("player");
 		g_paceAppliedMs = 0;
@@ -2725,7 +3210,6 @@ void __fastcall HookUpdateBattle(void* self, void* edx, int arg) {
 		g_stepLogs = 0;
 		Log("F4: sync test %s%d", g_syncN ? "ON, rollback frames = " : "OFF", g_syncN);
 	}
-
 	if (Pressed(VK_F2, 9)) {
 		if (g_inMode == InMode::Idle) {
 			g_rec.clear();
@@ -2779,7 +3263,6 @@ void __fastcall HookUpdateBattle(void* self, void* edx, int arg) {
 		}
 		if (f) fclose(f);
 	}
-
 	if (g_inMode == InMode::AutoReplay && g_frameIdx == 300 &&
 	    GetFileAttributesA("bbcse-dev/autoko.on") != INVALID_FILE_ATTRIBUTES) {
 		BYTE* chars = *reinterpret_cast<BYTE**>(Live(kObjMgr) + kCharsPtrOff);
@@ -2799,7 +3282,6 @@ void __fastcall HookUpdateBattle(void* self, void* edx, int arg) {
 		Log("F3: fast-forward uses UpdateBattle(%d)", g_resimArg);
 	}
 	if (g_syncN && g_mode == 0 && (g_inMode == InMode::Idle || g_inMode == InMode::AutoReplay)) SyncTestFrame(self, edx);
-
 	if (Pressed(VK_F11, 6)) {
 		if (g_inMode == InMode::Recording) {
 			g_endFrame = g_frameIdx;
@@ -2837,6 +3319,14 @@ void __fastcall HookUpdateBattle(void* self, void* edx, int arg) {
 	if (walled) RngCheckBetweenTicks();
 	else g_rngAfterValid = false;
 	g_origUpdate(self, edx, arg);
+	if (SceneFighting() && *reinterpret_cast<int*>(Live(kGameModeVa)) == kModeTraining && !g_origIsPaused()) {
+		static LONG s_trainingFrame = 0;
+		const BYTE* mgr = Live(kObjMgr);
+		const BYTE* chars = *reinterpret_cast<BYTE* const*>(mgr + kCharsPtrOff);
+		const int objectCount = *reinterpret_cast<const int*>(mgr + 0x62634);
+		const unsigned char* const* objects = *reinterpret_cast<const unsigned char* const* const*>(mgr + 0x62648);
+		FrameData_Update(chars, chars ? chars + 0x20140 : nullptr, ++s_trainingFrame, objects, objects ? objectCount : 0);
+	}
 	if (walled && SceneFighting()) RngMarkTick();
 	else g_rngAfterValid = false;
 	if (walled) SpectatorSync();
@@ -2850,8 +3340,10 @@ void __fastcall HookUpdateBattle(void* self, void* edx, int arg) {
 
 	const DWORD now = GetTickCount();
 	if (now - g_lastReport >= 1000) {
+#ifdef BBCSE_DEV_TOOLS
 		Log("1s: calls=%ld ticks=%ld skipped=%ld doubled=%ld  P1 frame %d -> %d  arg=%d mode=%d",
 			g_calls, g_ticks, g_skipped, g_doubled, before, P1FrameCounter(), arg, g_mode);
+#endif
 		if (*reinterpret_cast<int*>(Live(kGameMgr) + 8) == 4) LogNetCounters("no rollback (spectating?)");
 		if (g_spectating && g_specRngFixes) Log("SPECTATE: RNG wall stepped in %ld times", g_specRngFixes);
 		g_specRngFixes = 0;
@@ -2899,19 +3391,21 @@ void CxxTypeName(const EXCEPTION_RECORD* er, char* out, size_t cap) {
 		const char* name = reinterpret_cast<const char*>(ct[1] + 8);
 		strncpy_s(out, cap, name, _TRUNCATE);
 	} __except (EXCEPTION_EXECUTE_HANDLER) {
+		strcpy_s(out, cap, "?");
 	}
 }
 
 void WriteMiniDump(EXCEPTION_POINTERS* ep) {
 	using Dump_t = BOOL(WINAPI*)(HANDLE, DWORD, HANDLE, int, void*, void*, void*);
-	HMODULE dbghelp = LoadLibraryA("dbghelp.dll");
+	char sys[MAX_PATH]{};
+	GetSystemDirectoryA(sys, MAX_PATH);
+	HMODULE dbghelp = LoadLibraryA((std::string(sys) + "\\dbghelp.dll").c_str());
 	const auto dump = dbghelp ? reinterpret_cast<Dump_t>(GetProcAddress(dbghelp, "MiniDumpWriteDump")) : nullptr;
 	if (!dump) return;
 	const std::string path = g_crashDir + "bbcse-crash.dmp";
 	HANDLE f = CreateFileA(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
 	if (f == INVALID_HANDLE_VALUE) return;
 	struct { DWORD tid; EXCEPTION_POINTERS* ep; BOOL client; } info{GetCurrentThreadId(), ep, FALSE};
-
 	dump(GetCurrentProcess(), GetCurrentProcessId(), f, 0x40, &info, nullptr, nullptr);
 	CloseHandle(f);
 }
@@ -2934,7 +3428,7 @@ LONG CALLBACK CrashCapture(EXCEPTION_POINTERS* ep) {
 	const bool cxx = code == 0xE06D7363;
 	const bool fatal = code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_STACK_OVERFLOW ||
 	                   code == EXCEPTION_INT_DIVIDE_BY_ZERO || code == EXCEPTION_ILLEGAL_INSTRUCTION ||
-	                   code == 0xC0000409 ;
+	                   code == 0xC0000409;
 	if (!cxx && !fatal) return EXCEPTION_CONTINUE_SEARCH;
 	const LONG n = InterlockedIncrement(&g_crashEvents);
 	if (n > 8) return EXCEPTION_CONTINUE_SEARCH;
@@ -2944,7 +3438,6 @@ LONG CALLBACK CrashCapture(EXCEPTION_POINTERS* ep) {
 	std::string report;
 	sprintf_s(line, "EXCEPTION #%ld code %08lX %s at %s, thread %lu\n", n, code, type, where, GetCurrentThreadId());
 	report += line;
-
 	const BYTE* sp = reinterpret_cast<const BYTE*>(static_cast<UINT_PTR>(ep->ContextRecord->Esp));
 	int shown = 0;
 	for (int i = 0; i < 0x2000 && shown < 24; i += 4) {
@@ -2979,14 +3472,19 @@ constexpr DWORD kRoomCreateSlot = 0x9609F0;
 using RoomCreate_t = int(__fastcall*)(void* self, void* edx, BYTE* cfg);
 RoomCreate_t g_origRoomCreate = nullptr;
 int __fastcall HookRoomCreate(void* self, void* edx, BYTE* cfg) {
+#ifdef BBCSE_DEV_TOOLS
 	char hex[3 * 0x20 + 1] = {};
 	for (int i = 0; i < 0x20; ++i) sprintf_s(hex + 3 * i, 4, "%02X ", cfg[0x48 + i]);
 	Log("ROOM: create, Steam member limit %u, settings +0x48: %s", cfg[0x52], hex);
+#else
+	Log("ROOM: create, Steam member limit %u", cfg[0x52]);
+#endif
 	return g_origRoomCreate(self, edx, cfg);
 }
 
 void ReplaySync() {
 	const int f = g_replayFrame++;
+	if (f % 30) return;
 	const BYTE* chars = *reinterpret_cast<BYTE**>(Live(kObjMgr) + kCharsPtrOff);
 	Log("REPLAYSYNC frame %d hash %08lX hp %d %d", f, CrossPcHash(),
 		chars ? *reinterpret_cast<const int*>(chars + kHpOff) : -1,
@@ -3007,9 +3505,38 @@ void SpectatorSync() {
 	const int f = g_specBase + idx;
 	if ((f + 1) % kSyncEvery > 2) return;
 	const BYTE* chars = *reinterpret_cast<BYTE**>(Live(kObjMgr) + kCharsPtrOff);
-	Log("SPECSYNC frame %d (round index %d) hash %08lX hp %d %d", f, idx, CrossPcHash(),
+	Log("SPECSYNC frame %d (round index %d) hash %08lX hp %d %d%s", f, idx, CrossPcHash(),
 		chars ? *reinterpret_cast<const int*>(chars + kHpOff) : -1,
-		chars ? *reinterpret_cast<const int*>(chars + 0x20140 + kHpOff) : -1);
+		chars ? *reinterpret_cast<const int*>(chars + 0x20140 + kHpOff) : -1, PartsText(CrossPcParts()).c_str());
+}
+
+const char* SteamPersonaName(unsigned long long id);
+
+using RoomInfo_t = void*(__fastcall*)(void* self, void* edx, int index, BYTE* out);
+RoomInfo_t g_origRoomInfo = nullptr;
+
+void RoomOwnerName(int index, BYTE* out) {
+	__try {
+		using Instance_t = void**(__cdecl*)();
+		using Mgr_t = BYTE*(__fastcall*)(void* self, void* edx);
+		void* obj = *reinterpret_cast<Instance_t>(Live(0x4598B0))();
+		BYTE* mgr = reinterpret_cast<Mgr_t>((*reinterpret_cast<void***>(obj))[7])(obj, nullptr);
+		if (!mgr || index < 0 || index >= *reinterpret_cast<int*>(mgr + 0x444)) return;
+		const BYTE* room = *reinterpret_cast<BYTE**>(mgr + 0x448);
+		if (!room) return;
+		const unsigned long long owner = *reinterpret_cast<const unsigned long long*>(room + 0x50);
+		if ((owner >> 32) != 0x01100001) return;
+		const char* name = SteamPersonaName(owner);
+		if (!name || !*name || !strcmp(name, "[unknown]")) return;
+		strncpy_s(reinterpret_cast<char*>(out + 0x78), 32, name, _TRUNCATE);
+	} __except (EXCEPTION_EXECUTE_HANDLER) {
+	}
+}
+
+void* __fastcall HookRoomInfo(void* self, void* edx, int index, BYTE* out) {
+	void* r = g_origRoomInfo(self, edx, index, out);
+	if (out && *reinterpret_cast<int*>(out + 0x54)) RoomOwnerName(index, out);
+	return r;
 }
 
 void InstallTickHook() {
@@ -3033,6 +3560,8 @@ void InstallTickHook() {
 	g_origMatchMenu = reinterpret_cast<MatchMenu_t>(Live(kMatchMenuFn));
 	g_origNetInputMsg = reinterpret_cast<NetMsg_t>(Live(kNetInputMsgFn));
 	g_origNetRelayMsg = reinterpret_cast<NetMsg_t>(Live(kNetRelayMsgFn));
+	g_origNetRelayReply = reinterpret_cast<NetMsg_t>(Live(kNetRelayReplyFn));
+	g_origNetResend = reinterpret_cast<NetMsg_t>(Live(kNetResendFn));
 	{
 		void** slot = reinterpret_cast<void**>(Live(kRoomCreateSlot));
 		if (*slot == Live(0x442550)) {
@@ -3057,9 +3586,14 @@ void InstallTickHook() {
 		{kNetSendSite, kNetSendFn, reinterpret_cast<void*>(&HookNetSend)},
 		{kNetInputMsgSite, kNetInputMsgFn, reinterpret_cast<void*>(&HookNetInputMsg)},
 		{kNetRelayMsgSite, kNetRelayMsgFn, reinterpret_cast<void*>(&HookNetRelayMsg)},
+		{kNetRelayReplySite, kNetRelayReplyFn, reinterpret_cast<void*>(&HookNetRelayReply)},
+		{kNetResendSite, kNetResendFn, reinterpret_cast<void*>(&HookNetResend)},
 		{kNetFetchSite, kNetFetchFn, reinterpret_cast<void*>(&HookNetFetch)},
 		{kNetIndexSite, kNetIndexFn, reinterpret_cast<void*>(&HookNetIndex)},
 		{kMatchMenuSite, kMatchMenuFn, reinterpret_cast<void*>(&HookMatchMenu)},
+		{kPoolNewSite, kPoolNewFn, reinterpret_cast<void*>(&HookPoolNew)},
+		{kPoolDelSiteA, kOpDeleteFn, reinterpret_cast<void*>(&HookPoolDelete)},
+		{kPoolDelSiteB, kOpDeleteFn, reinterpret_cast<void*>(&HookPoolDelete)},
 	};
 
 	for (const Patch& pt : patches) {
@@ -3079,7 +3613,37 @@ void InstallTickHook() {
 		VirtualProtect(p, 5, old, &old);
 		FlushInstructionCache(GetCurrentProcess(), p, 5);
 	}
-
+	Palette_Init();
+	{
+		BYTE* p = Live(0x51291D);
+		const LONG rel = *reinterpret_cast<LONG*>(p + 1);
+		if (p[0] == 0xE8 && p + 5 + rel == Live(0x42D860)) {
+			Palette_SetPackFunctions(Live(0x42D860), Live(0x42D8E0));
+			DWORD old;
+			VirtualProtect(p, 5, PAGE_EXECUTE_READWRITE, &old);
+			*reinterpret_cast<LONG*>(p + 1) = static_cast<LONG>(reinterpret_cast<BYTE*>(&Palette_CssEntry) - (p + 5));
+			VirtualProtect(p, 5, old, &old);
+			FlushInstructionCache(GetCurrentProcess(), p, 5);
+			Log("palette: character select colors hooked");
+		} else {
+			Log("palette: character select colors NOT hooked (call site differs)");
+		}
+	}
+	{
+		BYTE* p = Live(0x59B86A);
+		const LONG rel = *reinterpret_cast<LONG*>(p + 1);
+		if (p[0] == 0xE8 && p + 5 + rel == Live(0x46D030)) {
+			g_origRoomInfo = reinterpret_cast<RoomInfo_t>(Live(0x46D030));
+			DWORD old;
+			VirtualProtect(p, 5, PAGE_EXECUTE_READWRITE, &old);
+			*reinterpret_cast<LONG*>(p + 1) = static_cast<LONG>(reinterpret_cast<BYTE*>(&HookRoomInfo) - (p + 5));
+			VirtualProtect(p, 5, old, &old);
+			FlushInstructionCache(GetCurrentProcess(), p, 5);
+			Log("room owner name hooked");
+		} else {
+			Log("room owner name NOT hooked (call site differs)");
+		}
+	}
 	{
 		static const BYTE expect[] = {0x83, 0xF8, 0x0C, 0x75};
 		BYTE* p = Live(0x47AAB7);
@@ -3096,11 +3660,28 @@ void InstallTickHook() {
 			Log("network menu fix NOT applied: bytes at 0x47AAB7 differ");
 		}
 	}
-	Log("tick hook installed (%u call sites). F5 freeze, F6 double, F7 step one frame while frozen.",
-		static_cast<unsigned>(sizeof(patches) / sizeof(patches[0])));
+	{
+		static const BYTE expect[] = {0xB9, 0x68, 0x01, 0x00, 0x00};
+		int done = 0;
+		for (const DWORD site : {0x45EB19u, 0x46588Eu}) {
+			BYTE* p = Live(site);
+			if (memcmp(p, expect, sizeof(expect)) != 0) continue;
+			DWORD old;
+			VirtualProtect(p + 1, 2, PAGE_EXECUTE_READWRITE, &old);
+			*reinterpret_cast<WORD*>(p + 1) = 1200;
+			VirtualProtect(p + 1, 2, old, &old);
+			FlushInstructionCache(GetCurrentProcess(), p + 1, 2);
+			++done;
+		}
+		Log("spectator timeout %s (%d of 2 sites)", done == 2 ? "6 s -> 20 s" : "NOT fully raised", done);
+	}
+	Log("tick hook installed (%u call sites)", static_cast<unsigned>(sizeof(patches) / sizeof(patches[0])));
+	PatchIat(kIatPerspectiveFov, reinterpret_cast<void*>(&HookPerspectiveFov), reinterpret_cast<void**>(&g_origPerspectiveFov));
+	InstallVersionSelect();
+#ifdef BBCSE_DEV_TOOLS
 	InstallInputProbe();
+#endif
 	InstallFlowHooks();
-
 	InstallDeviceHooks(*reinterpret_cast<void**>(Live(0xB8C800 + 0x2C)));
 }
 
@@ -3166,7 +3747,6 @@ HRESULT __stdcall HookCreateInputDevice(void* di, REFGUID guid, void** dev, void
 	const HRESULT hr = g_origCreateInputDevice(di, guid, dev, outer);
 	if (SUCCEEDED(hr) && dev && *dev && IsEqualGUID(guid, GUID_SysKeyboard)) {
 		g_keyboard = *dev;
-
 		PatchVtableSlot(*dev, 9, reinterpret_cast<void*>(&HookGetDeviceState), reinterpret_cast<void**>(&g_origGetDeviceState));
 		PatchVtableSlot(*dev, 10, reinterpret_cast<void*>(&HookGetDeviceData), reinterpret_cast<void**>(&g_origGetDeviceData));
 		Log("KEYS: keyboard remap active");
@@ -3176,7 +3756,7 @@ HRESULT __stdcall HookCreateInputDevice(void* di, REFGUID guid, void** dev, void
 void LoadKeyRemap() {
 	for (int k = 0; k < 256; ++k) g_keyMap[k] = static_cast<BYTE>(k);
 	char ini[MAX_PATH];
-	GetModuleFileNameA(GetModuleHandleA("dinput8.dll"), ini, MAX_PATH);
+	GetModuleFileNameA(g_self, ini, MAX_PATH);
 	char* slash = strrchr(ini, '\\');
 	*(slash ? slash + 1 : ini) = 0;
 	strcat_s(ini, "bbcse-net.ini");
@@ -3200,15 +3780,350 @@ void LoadKeyRemap() {
 	}
 }
 
+bool g_passive = false;
+
+std::string g_userVersion = "cse";
+std::string g_forcedVersion;
+std::string g_forcedReason;
+std::map<std::string, DWORD> g_versionHashes;
+
+DWORD HashFolder(const std::string& root, const std::string& rel, DWORD h) {
+	std::vector<std::string> names;
+	WIN32_FIND_DATAA fd{};
+	const HANDLE f = FindFirstFileA((root + rel + "*").c_str(), &fd);
+	if (f == INVALID_HANDLE_VALUE) return h;
+	do {
+		if (fd.cFileName[0] == '.') continue;
+		std::string n = fd.cFileName;
+		for (char& c : n) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+		names.push_back(n + ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? "\\" : ""));
+	} while (FindNextFileA(f, &fd));
+	FindClose(f);
+	std::sort(names.begin(), names.end());
+	for (const std::string& n : names) {
+		for (char c : rel + n) h = (h ^ static_cast<BYTE>(c)) * 16777619u;
+		if (n.back() == '\\') {
+			h = HashFolder(root, rel + n, h);
+			continue;
+		}
+		WIN32_FILE_ATTRIBUTE_DATA a{};
+		if (!GetFileAttributesExA((root + rel + n).c_str(), GetFileExInfoStandard, &a)) continue;
+		for (DWORD v : {a.nFileSizeLow, a.nFileSizeHigh})
+			for (int i = 0; i < 4; ++i) h = (h ^ ((v >> (8 * i)) & 0xFF)) * 16777619u;
+	}
+	return h;
+}
+
+bool VersionNameOk(const std::string& name) {
+	if (name.empty() || name.size() > 8) return false;
+	for (char c : name)
+		if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-')) return false;
+	return true;
+}
+
+DWORD VersionHash(const std::string& name) {
+	if (name == "cse") return 0;
+	if (!VersionNameOk(name)) return 1;
+	const auto it = g_versionHashes.find(name);
+	if (it != g_versionHashes.end()) return it->second;
+	const std::string dir = VersionsRoot() + name + "\\";
+	if (GetFileAttributesA(dir.c_str()) == INVALID_FILE_ATTRIBUTES) return 1;
+	const DWORD h = HashFolder(dir, "", 2166136261u) | 2;
+	g_versionHashes[name] = h;
+	return h;
+}
+
+bool ApplyVersion(const std::string& name) {
+	if (!VersionNameOk(name)) return false;
+	std::string dir = VersionsRoot() + name + "\\";
+	if (GetFileAttributesA(dir.c_str()) == INVALID_FILE_ATTRIBUTES) {
+		if (name != "cse") return false;
+		dir.clear();
+	}
+	if (name == g_versionName) return true;
+	EnterCriticalSection(&g_versionLock);
+	g_versionName = name;
+	g_versionDir = dir;
+	LeaveCriticalSection(&g_versionLock);
+	g_versionRedirects = 0;
+	Log("VERSION: %s selected%s", g_versionName.c_str(), dir.empty() ? " (game files)" : "");
+	ApplyVersionRules();
+	return true;
+}
+
+void LoadSavedVersion() {
+	char saved[16] = {};
+	GetPrivateProfileStringA("menu", "version", "cse", saved, sizeof(saved), (ModuleDir(g_self) + "bbcse-im.ini").c_str());
+	std::string want = saved;
+	for (char& c : want) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+	const std::string dir = VersionsRoot() + want + "\\";
+	if (want == "cse" || !VersionNameOk(want) || GetFileAttributesA(dir.c_str()) == INVALID_FILE_ATTRIBUTES) {
+		const std::string cseDir = VersionsRoot() + "cse\\";
+		if (GetFileAttributesA(cseDir.c_str()) != INVALID_FILE_ATTRIBUTES) {
+			EnterCriticalSection(&g_versionLock);
+			g_versionDir = cseDir;
+			LeaveCriticalSection(&g_versionLock);
+		}
+		Log("VERSION: cse (choose another in the IM BBCS:EX menu, F2)");
+		return;
+	}
+	EnterCriticalSection(&g_versionLock);
+	g_versionName = want;
+	g_versionDir = dir;
+	LeaveCriticalSection(&g_versionLock);
+	g_userVersion = want;
+	Log("VERSION: %s (saved choice; change it in the IM BBCS:EX menu, F2)", want.c_str());
+}
+
+constexpr int kVersionChannel = 3;
+constexpr DWORD kVerAsk = 0x51565942, kVerAnswer = 0x41565942, kVerCannot = 0x4E565942;
+constexpr DWORD kVerAskEvery = 1000, kVerTimeout = 4000;
+
+void SetForced(const std::string& name, const char* reason) {
+	if (g_poolMem) return;
+	if (g_forcedVersion != name || g_forcedReason != reason) {
+		g_forcedVersion = name;
+		g_forcedReason = reason;
+		Log("VERSION: lobby %s -> %s", reason, name.empty() ? g_userVersion.c_str() : name.c_str());
+	}
+	ApplyVersion(name.empty() ? g_userVersion : name);
+}
+
+bool Readable(const void* p, size_t n) {
+	MEMORY_BASIC_INFORMATION mbi{};
+	if (!p || !VirtualQuery(p, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT) return false;
+	if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return false;
+	return static_cast<const BYTE*>(p) + n <= static_cast<const BYTE*>(mbi.BaseAddress) + mbi.RegionSize;
+}
+
+unsigned long long MemberId(const BYTE* member) {
+	return Readable(member, 0x78) ? *reinterpret_cast<const unsigned long long*>(member + 0x70) : 0;
+}
+
+bool Connected(unsigned long long who) {
+	P2PState st{};
+	return who && g_steamNet && g_steamNet->SessionState(who, &st) && (st.active || st.connecting);
+}
+
+void VersionSyncTick() {
+	static DWORD s_last = 0, s_lastAsk = 0, s_lastAnswer = 0, s_sessionStart = 0;
+	static std::map<unsigned long long, DWORD> s_asked;
+	static std::map<unsigned long long, DWORD> s_cannot;
+	const DWORD now = GetTickCount();
+	if (now - s_last < 100) return;
+	s_last = now;
+	if (!g_steamNet) {
+		using GetNet_t = ISteamNet*(__cdecl*)();
+		const HMODULE steam = GetModuleHandleA("steam_api.dll");
+		const auto getNet = steam ? reinterpret_cast<GetNet_t>(GetProcAddress(steam, "SteamNetworking")) : nullptr;
+		g_steamNet = getNet ? getNet() : nullptr;
+		if (!g_steamNet) return;
+	}
+	BYTE* ses = Live(kNetSession);
+	BYTE* self = *reinterpret_cast<BYTE**>(ses + 0x12040);
+	BYTE* host = *reinterpret_cast<BYTE**>(ses + 0x12044);
+	const unsigned long long hostId = MemberId(host);
+	const bool amHost = Readable(self, 0x5C) && (self == host || (*reinterpret_cast<const WORD*>(self + 0x5A) & 2));
+	bool inSession = false;
+	if (amHost) {
+		for (int side = 0; side < 2; ++side) {
+			BYTE* peer = NetPeer(side);
+			const unsigned long long id = peer != self ? MemberId(peer) : 0;
+			if (id && Connected(id)) inSession = true;
+		}
+	} else {
+		inSession = Readable(self, 0x5C) && hostId && Connected(hostId);
+	}
+	if (!inSession) {
+		static bool s_seenLogged = false;
+		if (!s_seenLogged && Readable(self, 0x5C) && host) {
+			s_seenLogged = true;
+			Log("VERSION: room members seen, no P2P link yet (host %s)", amHost ? "is this PC" : "is remote");
+		}
+		if (s_sessionStart) Log("VERSION: online room ended");
+		s_sessionStart = 0;
+		s_asked.clear();
+		s_cannot.clear();
+		if (!g_forcedVersion.empty() || !g_forcedReason.empty()) SetForced("", "left");
+		if (!g_forcedReason.empty() && !g_poolMem) g_forcedReason.clear();
+		return;
+	}
+	if (!s_sessionStart) {
+		s_sessionStart = now;
+		s_lastAnswer = now;
+		Log("VERSION: online room, this PC is %s (own choice %s)", amHost ? "the host" : "a guest", g_userVersion.c_str());
+	}
+	unsigned size = 0, got = 0;
+	unsigned long long from = 0;
+	DWORD msg[4];
+	for (int n = 0; n < 64 && g_steamNet->Available(&size, kVersionChannel); ++n) {
+		if (size > sizeof(msg)) {
+			std::vector<unsigned char> drop(size);
+			g_steamNet->Read(drop.data(), size, &got, &from, kVersionChannel);
+			continue;
+		}
+		if (!g_steamNet->Read(msg, sizeof(msg), &got, &from, kVersionChannel)) break;
+		if (got != sizeof(msg)) continue;
+		if (amHost && msg[0] == kVerAsk) {
+			s_asked[from] = now;
+			DWORD out[4] = {kVerAnswer, 0, 0, VersionHash(g_versionName)};
+			memcpy(&out[1], g_versionName.c_str(), (std::min)(g_versionName.size(), static_cast<size_t>(8)));
+			g_steamNet->Send(from, out, sizeof(out), 2, kVersionChannel);
+		} else if (amHost && msg[0] == kVerCannot) {
+			s_cannot[from] = now;
+		} else if (!amHost && from == hostId && msg[0] == kVerAnswer) {
+			s_lastAnswer = now;
+			char name[9] = {};
+			memcpy(name, &msg[1], 8);
+			std::string want = name;
+			for (char& c : want) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+			if (VersionNameOk(want) && VersionHash(want) == msg[3] && (want == "cse" || GetFileAttributesA((VersionsRoot() + want).c_str()) != INVALID_FILE_ATTRIBUTES)) {
+				SetForced(want, "host picked");
+			} else {
+				DWORD out[4] = {kVerCannot, 0, 0, 0};
+				g_steamNet->Send(hostId, out, sizeof(out), 2, kVersionChannel);
+				SetForced("cse", "has different files from the host, playing");
+			}
+		}
+	}
+	if (amHost) {
+		const char* reason = nullptr;
+		for (int side = 0; side < 2 && !reason; ++side) {
+			BYTE* peer = NetPeer(side);
+			const unsigned long long id = peer != self ? MemberId(peer) : 0;
+			if (!id) continue;
+			const auto c = s_cannot.find(id);
+			if (c != s_cannot.end() && now - c->second < kVerTimeout * 3) reason = "opponent has different files, playing";
+			const auto a = s_asked.find(id);
+			if (!reason && now - s_sessionStart > kVerTimeout && (a == s_asked.end() || now - a->second > kVerTimeout))
+				reason = "opponent has no version select, playing";
+		}
+		if (reason) SetForced("cse", reason);
+		else if (!g_forcedVersion.empty()) SetForced("", "back to own choice");
+		return;
+	}
+	if (now - s_lastAsk >= kVerAskEvery) {
+		s_lastAsk = now;
+		const DWORD out[4] = {kVerAsk, 0, 0, 0};
+		g_steamNet->Send(hostId, out, sizeof(out), 2, kVersionChannel);
+	}
+	if (now - s_lastAnswer > kVerTimeout && g_forcedVersion.empty()) SetForced("cse", "host has no version select, playing");
+}
+
+constexpr int kPaletteChannel = 4;
+
+const char* SteamPersonaName(unsigned long long id) {
+	using Friends_t = void*(__cdecl*)();
+	using Name_t = const char*(__thiscall*)(void*, unsigned long long);
+	const HMODULE steam = GetModuleHandleA("steam_api.dll");
+	const auto get = steam ? reinterpret_cast<Friends_t>(GetProcAddress(steam, "SteamFriends")) : nullptr;
+	void* friends = get ? get() : nullptr;
+	if (!friends) return nullptr;
+	return reinterpret_cast<Name_t>((*reinterpret_cast<void***>(friends))[7])(friends, id);
+}
+
+void PaletteSyncTick() {
+	static unsigned long long s_sentStamp = 0, s_sentPeer = 0, s_namedPeer = 0;
+	static DWORD s_last = 0;
+	static unsigned char s_buf[16384];
+	BYTE* self = *reinterpret_cast<BYTE**>(Live(kNetSession) + 0x12040);
+	const WORD flags = Readable(self, 0x5C) ? *reinterpret_cast<const WORD*>(self + 0x5A) : 0;
+	const bool player = (flags & 0x10) != 0;
+	const int side = flags & 1;
+	BYTE* peer = player ? NetPeer(1 - side) : nullptr;
+	const unsigned long long peerId = peer && peer != self ? MemberId(peer) : 0;
+	const bool online = g_steamNet && g_poolMem && player && peerId && *reinterpret_cast<int*>(Live(kGameModeVa)) == 4;
+	Palette_SetOnline(online, side, peerId);
+	if (!online) return;
+	if (peerId != s_namedPeer) {
+		s_namedPeer = peerId;
+		Palette_SetPeerName(peerId, SteamPersonaName(peerId));
+	}
+	unsigned size = 0, got = 0;
+	unsigned long long from = 0;
+	static unsigned char s_lastMsg[16384];
+	int lastLen = 0;
+	unsigned long long lastFrom = 0;
+	static int s_pendingLen = 0;
+	static unsigned long long s_pendingFrom = 0;
+	static DWORD s_lastApply = 0;
+	for (int n = 0; n < 64 && g_steamNet->Available(&size, kPaletteChannel); ++n) {
+		if (size > sizeof(s_buf)) {
+			std::vector<unsigned char> drop(size);
+			g_steamNet->Read(drop.data(), size, &got, &from, kPaletteChannel);
+			continue;
+		}
+		if (!g_steamNet->Read(s_buf, sizeof(s_buf), &got, &from, kPaletteChannel)) break;
+		if (from != peerId || got > sizeof(s_buf)) continue;
+		memcpy(s_lastMsg, s_buf, got);
+		lastLen = static_cast<int>(got);
+		lastFrom = from;
+	}
+	if (lastLen) {
+		s_pendingLen = lastLen;
+		s_pendingFrom = lastFrom;
+	}
+	if (s_pendingLen && GetTickCount() - s_lastApply >= 250) {
+		Palette_Receive(s_lastMsg, s_pendingLen, s_pendingFrom);
+		s_pendingLen = 0;
+		s_lastApply = GetTickCount();
+	}
+	const DWORD now = GetTickCount();
+	if (now - s_last < 250) return;
+	s_last = now;
+	const unsigned long long stamp = Palette_LocalStamp();
+	if (!stamp || (stamp == s_sentStamp && peerId == s_sentPeer)) return;
+	const int len = Palette_BuildPacket(s_buf, sizeof(s_buf));
+	if (len > 0 && g_steamNet->Send(peerId, s_buf, static_cast<unsigned>(len), 2, kPaletteChannel)) {
+		s_sentStamp = stamp;
+		s_sentPeer = peerId;
+		Log("PALETTE: sent own palette");
+	}
+}
+
+}
+
+void Palette_Log(const char* text) { Log("%s", text); }
+
+void Version_List(std::vector<std::string>& out) {
+	out.assign(1, "cse");
+	WIN32_FIND_DATAA fd{};
+	const HANDLE h = FindFirstFileA((VersionsRoot() + "*").c_str(), &fd);
+	if (h == INVALID_HANDLE_VALUE) return;
+	do {
+		if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && fd.cFileName[0] != '.' && _stricmp(fd.cFileName, "cse") != 0) out.push_back(fd.cFileName);
+	} while (FindNextFileA(h, &fd));
+	FindClose(h);
+}
+const char* Version_Current() { return g_versionName.c_str(); }
+bool Version_Locked() { return g_poolMem != nullptr || !g_forcedVersion.empty(); }
+bool Version_InFight() { return g_poolMem != nullptr; }
+const char* Version_ForcedReason() { return g_forcedVersion.empty() ? "" : g_forcedReason.c_str(); }
+std::string Version_LoadedCodes() {
+	EnterCriticalSection(&g_versionLock);
+	const std::string out = g_versionLoaded;
+	LeaveCriticalSection(&g_versionLock);
+	return out;
+}
+void Version_Select(const char* name) {
+	if (Version_Locked() || !name) return;
+	std::string want = name;
+	for (char& c : want) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+	if (!ApplyVersion(want)) return;
+	g_userVersion = want;
+	g_versionHashes.erase(want);
+	VersionHash(want);
+	WritePrivateProfileStringA("menu", "version", want.c_str(), (ModuleDir(g_self) + "bbcse-im.ini").c_str());
 }
 
 extern "C" HRESULT WINAPI DirectInput8Create(HINSTANCE inst, DWORD version, REFIID iid,
                                              LPVOID* out, LPUNKNOWN outer) {
+	if (g_passive) return LoadRealDinput() ? g_realCreate(inst, version, iid, out, outer) : E_FAIL;
 	InstallTickHook();
 	if (!LoadRealDinput()) {
 		MessageBoxA(nullptr,
-			"bbcse-probe: could not load the real dinput8.dll.",
-			"bbcse-probe", MB_OK | MB_ICONERROR);
+			"Could not load the real dinput8.dll.",
+			"BBCSE rollback", MB_OK | MB_ICONERROR);
 		return E_FAIL;
 	}
 	const HRESULT hr = g_realCreate(inst, version, iid, out, outer);
@@ -3230,15 +4145,59 @@ BOOL APIENTRY DllMain(HMODULE self, DWORD reason, LPVOID) {
 	}
 
 	DisableThreadLibraryCalls(self);
+	g_self = self;
+#ifdef BBCSE_PROXY_WINMM
+	const bool winmmOk = LoadRealWinmm(self);
+#endif
+	{
+		char name[64];
+		sprintf_s(name, "Local\\bbcse-probe-%lu", GetCurrentProcessId());
+		CreateMutexA(nullptr, FALSE, name);
+		if (GetLastError() == ERROR_ALREADY_EXISTS) {
+			g_passive = true;
+			return TRUE;
+		}
+	}
 
 	const std::string logPath = ModuleDir(self) + "bbcse-probe.log";
-
-	MoveFileExA(logPath.c_str(), (ModuleDir(self) + "bbcse-probe.prev.log").c_str(), MOVEFILE_REPLACE_EXISTING);
-	g_log = _fsopen(logPath.c_str(), "w", _SH_DENYNO);
+	WIN32_FILE_ATTRIBUTE_DATA fa{};
+	if (GetFileAttributesExA(logPath.c_str(), GetFileExInfoStandard, &fa) && (fa.nFileSizeHigh || fa.nFileSizeLow > (20u << 20)))
+		MoveFileExA(logPath.c_str(), (ModuleDir(self) + "bbcse-probe.old.log").c_str(), MOVEFILE_REPLACE_EXISTING);
+	g_log = _fsopen(logPath.c_str(), "a", _SH_DENYNO);
+	if (g_log) {
+		SYSTEMTIME t;
+		GetLocalTime(&t);
+		fprintf(g_log, "\n===== session %04d-%02d-%02d %02d:%02d:%02d =====\n", t.wYear, t.wMonth, t.wDay, t.wHour,
+		        t.wMinute, t.wSecond);
+	}
 
 	Log("bbcse-probe attached");
 	InstallCrashCapture(self);
+	InstallVersionSelect();
+#ifdef BBCSE_DEV_TOOLS
 	ReportProcess();
+#endif
+#ifdef BBCSE_PROXY_WINMM
+	Log("loaded as winmm.dll; real winmm %s", winmmOk ? "loaded" : "NOT FOUND (timers will fail)");
+	if (!winmmOk)
+		MessageBoxA(nullptr, "Could not load the real winmm.dll.", "BBCSE rollback", MB_OK | MB_ICONERROR);
+	{
+		void** slot = reinterpret_cast<void**>(reinterpret_cast<BYTE*>(GetModuleHandleA(nullptr)) + (kDinputCreateIat - kImage));
+		HMODULE di = GetModuleHandleA("dinput8.dll");
+		void* real = di ? reinterpret_cast<void*>(GetProcAddress(di, "DirectInput8Create")) : nullptr;
+		if (real && *slot == real) {
+			g_realCreate = reinterpret_cast<DirectInput8Create_t>(real);
+			DWORD old;
+			VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &old);
+			*slot = reinterpret_cast<void*>(&DirectInput8Create);
+			VirtualProtect(slot, sizeof(void*), old, &old);
+			Log("DirectInput8Create hooked through the exe import slot (dinput8 at %p untouched)", di);
+		} else {
+			Log("DirectInput8Create NOT hooked (slot %p holds %p, dinput8 export %p): no rollback this session",
+			    slot, *slot, real);
+		}
+	}
+#endif
 	LoadRealDinput();
 	InstallVsyncOff(self);
 	InstallCloudFix(self);

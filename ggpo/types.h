@@ -55,7 +55,7 @@ typedef int int32;
    do {                                                     \
       if (!(x)) {                                           \
          char assert_buf[1024];                             \
-         /* bbcse: no __FILE__ (it put the build machine's path into the DLL) */ \
+         /* bbcse: no __FILE__, keeps build paths out of the DLL */ \
          snprintf(assert_buf, sizeof(assert_buf) - 1, "Assertion: %s @ line %d (pid:%d)", #x, __LINE__, Platform::GetProcessID()); \
          Log("%s\n", assert_buf);                           \
          Log("\n");                                         \
