@@ -1208,6 +1208,7 @@ bool g_poolCheck = false;
 LONG g_ppSaves = 0, g_ppFull = 0, g_ppPages = 0, g_ppLoads = 0, g_ppLoadPages = 0, g_ppMismatch = 0;
 
 void* __cdecl HookPoolNew(size_t n) {
+	g_sceneForSlots = nullptr;
 	void* p = VirtualAlloc(nullptr, n, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE);
 	if (!p) {
 		Log("POOL: write-watch allocation failed (%lu); the pool is saved whole", GetLastError());
@@ -1227,6 +1228,7 @@ void __cdecl HookPoolDelete(void* p) {
 	if (p && p == g_poolMem) {
 		VirtualFree(p, 0, MEM_RELEASE);
 		g_poolMem = nullptr;
+		g_sceneForSlots = nullptr;
 		Log("POOL: object pool %p freed (battle over)", p);
 		return;
 	}
