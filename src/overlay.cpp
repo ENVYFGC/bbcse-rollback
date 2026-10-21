@@ -205,6 +205,25 @@ static void DrawGamePage() {
 	const std::string codes = Version_LoadedCodes();
 	if (_stricmp(Version_Current(), "cse") != 0)
 		ImGui::Text("Last fight, loaded from %s: %s", UpperVersion().c_str(), codes.empty() ? "nothing yet" : CharacterNames(codes).c_str());
+	ImGui::Spacing();
+	ImGui::SeparatorText("Save");
+	static int s_unlocked = -2;
+	if (Version_InFight()) ImGui::BeginDisabled();
+	if (ImGui::Button("Unlock all gallery items")) ImGui::OpenPopup("unlock");
+	if (Version_InFight()) ImGui::EndDisabled();
+	if (ImGui::BeginPopupModal("unlock", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+		ImGui::TextUnformatted("Marks every gallery item as bought: Unlimited characters, colors, art, movies, voices.");
+		ImGui::TextUnformatted("The current save is copied to Save\\bbsave.before-unlock.dat first.");
+		if (ImGui::Button("Unlock", ImVec2(120, 0))) {
+			s_unlocked = Save_UnlockGallery();
+			ImGui::CloseCurrentPopup();
+		}
+		ImGui::SameLine();
+		if (ImGui::Button("Cancel", ImVec2(120, 0))) ImGui::CloseCurrentPopup();
+		ImGui::EndPopup();
+	}
+	if (s_unlocked >= 0) ImGui::TextDisabled("%d items unlocked. Restart the game to see them.", s_unlocked);
+	else if (s_unlocked == -1) ImGui::TextDisabled("Could not read or write Save\\bbsave.dat.");
 	ImGui::PushTextWrapPos(0.0f);
 	if (Version_ForcedReason()[0])
 		ImGui::TextColored(ImVec4(1, 0.8f, 0.35f, 1), "Online: %s %s. Your own choice comes back when you leave the room.", Version_ForcedReason(), UpperVersion().c_str());

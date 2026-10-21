@@ -31,5 +31,6 @@ bool Version_InFight();
 const char* Version_ForcedReason();
 std::string Version_LoadedCodes();
 void Version_Select(const char* name);
+int Save_UnlockGallery();
 void Overlay_BeforeReset();
 void Overlay_AfterReset();

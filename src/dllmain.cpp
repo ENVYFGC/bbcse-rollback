@@ -4097,6 +4097,33 @@ void Version_List(std::vector<std::string>& out) {
 	} while (FindNextFileA(h, &fd));
 	FindClose(h);
 }
+int Save_UnlockGallery() {
+	if (g_poolMem) return -1;
+	const std::string dir = ModuleDir(g_self) + "Save\\";
+	const std::string path = dir + "bbsave.dat";
+	FILE* f = nullptr;
+	if (fopen_s(&f, path.c_str(), "rb") || !f) return -1;
+	std::vector<BYTE> file(0xE8B28);
+	const size_t got = fread(file.data(), 1, file.size(), f);
+	fclose(f);
+	if (got != file.size() || memcmp(file.data() + 8, "Save", 4) != 0) return -1;
+	BYTE* mem = Live(0xC013B0);
+	if (!Readable(mem, 0xE8B28) || memcmp(mem + 8, "Save", 4) != 0) return -1;
+	if (!CopyFileA(path.c_str(), (dir + "bbsave.before-unlock.dat").c_str(), TRUE) && GetLastError() != ERROR_FILE_EXISTS) return -1;
+	int n = 0;
+	for (int i = 0x160; i < 0x160 + 0x1F2; ++i) {
+		if (mem[i] == 0) mem[i] = 2;
+		if (file[i] == 0) { file[i] = 2; ++n; }
+	}
+	const std::string tmp = path + ".tmp";
+	if (fopen_s(&f, tmp.c_str(), "wb") || !f) return -1;
+	bool ok = fwrite(file.data(), 1, file.size(), f) == file.size();
+	ok = (fclose(f) == 0) && ok;
+	ok = ok && MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+	if (!ok) DeleteFileA(tmp.c_str());
+	Log("SAVE: unlocked %d gallery items%s", n, ok ? "" : " (file write failed)");
+	return ok ? n : -1;
+}
 const char* Version_Current() { return g_versionName.c_str(); }
 bool Version_Locked() { return g_poolMem != nullptr || !g_forcedVersion.empty(); }
 bool Version_InFight() { return g_poolMem != nullptr; }
