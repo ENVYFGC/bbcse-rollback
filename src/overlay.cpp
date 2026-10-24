@@ -14,7 +14,7 @@
 #include "imfont.h"
 
 OverlayStats g_ovl;
-static bool s_ready = false, s_visible = true, s_f1Down = false, s_f3Down = false, s_f4Down = false;
+static bool s_ready = false, s_visible = true, s_f1Down = false, s_f3Down = false, s_f4Down = false, s_f5Down = false;
 static bool s_menuOpen = false, s_f2Down = false;
 static bool s_netBar = true;
 static WNDPROC s_origWndProc = nullptr;
@@ -184,8 +184,8 @@ static void DrawVersionBadge() {
 static const char* VersionDescription(const std::string& v) {
 	if (_stricmp(v.c_str(), "cse") == 0) return "Continuum Shift Extend, the PC game as it is.";
 	if (_stricmp(v.c_str(), "cs2") == 0) return "Continuum Shift 2: version 2.0 characters.";
-	if (_stricmp(v.c_str(), "cs1") == 0) return "Continuum Shift: version 1.00 characters and system rules.";
-	return "Files from the bbcse-versions folder of the same name.";
+	if (_stricmp(v.c_str(), "cs1") == 0) return "Continuum Shift: version 1.02 characters and system rules.";
+	return "";
 }
 
 static void DrawGamePage() {
@@ -201,6 +201,13 @@ static void DrawGamePage() {
 		ImGui::TextDisabled("%s", VersionDescription(v));
 	}
 	if (locked) ImGui::EndDisabled();
+	if (Version_Problem()[0]) {
+		std::string bad = Version_Problem();
+		for (char& c : bad) c = static_cast<char>(toupper(static_cast<unsigned char>(c)));
+		ImGui::PushTextWrapPos(0.0f);
+		ImGui::TextColored(ImVec4(1, 0.35f, 0.35f, 1), "%s off: files in bbcse-versions are missing or changed. Copy the folder from the zip again and restart the game.", bad.c_str());
+		ImGui::PopTextWrapPos();
+	}
 	ImGui::Spacing();
 	const std::string codes = Version_LoadedCodes();
 	if (_stricmp(Version_Current(), "cse") != 0)
@@ -244,6 +251,20 @@ static void DrawTrainingPage() {
 	ImGui::TextDisabled("F4");
 	ImGui::SeparatorText("Tools");
 	ImGui::Checkbox("Palette editor", &g_paletteEditorVisible);
+	ImGui::SeparatorText("Position reset");
+	ImGui::RadioButton("Center", &g_posPreset, 0);
+	ImGui::SameLine();
+	ImGui::RadioButton("Me in the corner", &g_posPreset, 1);
+	ImGui::SameLine();
+	ImGui::RadioButton("Opponent in the corner", &g_posPreset, 2);
+	ImGui::Checkbox("Swap sides", &g_posRight);
+	if (ImGui::Button("Reset")) Training_ResetPosition();
+	ImGui::SameLine();
+#ifndef BBCSE_DEV_TOOLS
+	ImGui::TextDisabled("F5 or Select");
+#else
+	ImGui::TextDisabled("Select");
+#endif
 	ImGui::Spacing();
 	ImGui::TextDisabled("Shown in Training mode only.");
 }
@@ -295,6 +316,9 @@ static void DrawMenu() {
 	ImGui::TextDisabled("F1  online panel");
 	ImGui::TextDisabled("F3  frame advantage");
 	ImGui::TextDisabled("F4  hitboxes");
+#ifndef BBCSE_DEV_TOOLS
+	ImGui::TextDisabled("F5  reset position");
+#endif
 	ImGui::EndChild();
 	ImGui::SameLine();
 	ImGui::BeginChild("##page", ImVec2(0, 0));
@@ -396,6 +420,11 @@ void Overlay_OnPresent(IDirect3DDevice9* dev) {
 	const bool f4 = KeyDown(VK_F4);
 	if (f4 && !s_f4Down) g_hitboxVisible = !g_hitboxVisible;
 	s_f4Down = f4;
+#ifndef BBCSE_DEV_TOOLS
+	const bool f5 = KeyDown(VK_F5);
+	if (f5 && !s_f5Down) Training_ResetPosition();
+	s_f5Down = f5;
+#endif
 	const bool f2 = KeyDown(VK_F2);
 	if (f2 && !s_f2Down) s_menuOpen = !s_menuOpen;
 	s_f2Down = f2;

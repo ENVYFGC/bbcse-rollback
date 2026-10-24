@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <algorithm>
 #include <map>
+#include <set>
 #include <array>
 #include <string>
 #include <vector>
@@ -212,7 +213,6 @@ constexpr DWORD kPoolPtrOff = 0x62650;
 constexpr DWORD kPoolSize = 400 * 0x20E8;
 constexpr DWORD kListOffs[3] = {0x62644, 0x62648, 0x6264C};
 constexpr DWORD kScrollList = 0xB7B6C4;
-constexpr DWORD kScrollFallback = 0x40;
 constexpr DWORD kCameraZoom = 0xB7C40C;
 constexpr DWORD kRenderView = 0xB8C9D0;
 constexpr DWORD kRenderViewSize = 0x220;
@@ -234,51 +234,11 @@ struct Region { const char* name; BYTE* addr; DWORD size; };
 struct Snapshot { Region regions[kRegions]; std::string data[kRegions]; bool valid = false; };
 Snapshot g_snap;
 
-SIZE_T GuardedHeapSize(HANDLE heap, const void* p) {
-	__try {
-		return HeapValidate(heap, 0, p) ? HeapSize(heap, 0, p) : static_cast<SIZE_T>(-1);
-	} __except (EXCEPTION_EXECUTE_HANDLER) {
-		return static_cast<SIZE_T>(-1);
-	}
-}
+__declspec(thread) int t_probing = 0;
+struct ProbeScope { ProbeScope() { ++t_probing; } ~ProbeScope() { --t_probing; } };
+constexpr DWORD kScrollBytes = 0x11C;
 
-SIZE_T HeapBlockSize(const void* p) {
-	HANDLE heaps[64];
-	const DWORD n = GetProcessHeaps(64, heaps);
-	for (DWORD i = 0; i < n && i < 64; ++i) {
-		const SIZE_T s = GuardedHeapSize(heaps[i], p);
-		if (s != static_cast<SIZE_T>(-1)) return s;
-	}
-	return 0;
-}
-
-DWORD ScrollSize(const BYTE* scroll) {
-	static const BYTE* cachedFor = nullptr;
-	static DWORD cached = 0;
-	if (scroll != cachedFor) {
-		const SIZE_T s = HeapBlockSize(scroll);
-		cached = (s >= 0x10 && s <= 0x400) ? static_cast<DWORD>(s) : kScrollFallback;
-		cachedFor = scroll;
-		Log("scroll object %p: size 0x%lX (%s)", scroll, cached, s ? "from heap" : "fallback");
-	}
-	return cached;
-}
-
-DWORD ListSize(const BYTE* list) {
-	static const BYTE* cachedFor[3] = {};
-	static DWORD cached[3] = {};
-	for (int i = 0; i < 3; ++i)
-		if (cachedFor[i] == list) return cached[i];
-	const SIZE_T s = HeapBlockSize(list);
-	DWORD size = 0;
-	if (s >= 0x10 && s <= 0x4000) size = static_cast<DWORD>(s);
-	else Log("WARNING: list %p has no readable heap size; not saved", list);
-	static int next = 0;
-	cachedFor[next] = list;
-	cached[next] = size;
-	next = (next + 1) % 3;
-	return size;
-}
+constexpr DWORD kListBytes = 0x648;
 
 DWORD Fnv(const BYTE* p, DWORD n) {
 	DWORD h = 2166136261u;
@@ -306,7 +266,7 @@ bool CurrentRegions(Region out[kRegions]) {
 	const DWORD count = *reinterpret_cast<const DWORD*>(Live(kScrollList) + 8);
 	BYTE* scroll = (list[0] && count >= 1) ? *reinterpret_cast<BYTE* const*>(list[0]) : nullptr;
 	if (!scroll) return false;
-	out[10] = {"scroll", scroll, ScrollSize(scroll)};
+	out[10] = {"scroll", scroll, kScrollBytes};
 	BYTE* pool = *reinterpret_cast<BYTE**>(mgr + kPoolPtrOff);
 	if (!pool) return false;
 	out[11] = {"objpool", pool, kPoolSize};
@@ -314,7 +274,7 @@ bool CurrentRegions(Region out[kRegions]) {
 	for (int i = 0; i < 3; ++i) {
 		BYTE* list = *reinterpret_cast<BYTE**>(mgr + kListOffs[i]);
 		if (!list) return false;
-		out[12 + i] = {kListNames[i], list, ListSize(list)};
+		out[12 + i] = {kListNames[i], list, kListBytes};
 	}
 	return true;
 }
@@ -418,9 +378,7 @@ bool ReadableRange(const BYTE* p, DWORD n) {
 
 #ifdef BBCSE_DEV_TOOLS
 void ReportHeapBlock(const char* what, const void* p) {
-	const SIZE_T s = HeapBlockSize(p);
-	if (s) Log("  %s %p: heap block size 0x%X", what, p, static_cast<unsigned>(s));
-	else Log("  %s %p: not a heap block start (custom allocator or interior pointer)", what, p);
+	Log("  %s %p", what, p);
 }
 
 const char* ClassOf(const BYTE* obj) {
@@ -1207,8 +1165,10 @@ std::vector<BYTE> g_poolDirty[kPoolHist];
 bool g_poolCheck = false;
 LONG g_ppSaves = 0, g_ppFull = 0, g_ppPages = 0, g_ppLoads = 0, g_ppLoadPages = 0, g_ppMismatch = 0;
 
+void TrainingPositionEnd();
 void* __cdecl HookPoolNew(size_t n) {
 	g_sceneForSlots = nullptr;
+	TrainingPositionEnd();
 	void* p = VirtualAlloc(nullptr, n, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE);
 	if (!p) {
 		Log("POOL: write-watch allocation failed (%lu); the pool is saved whole", GetLastError());
@@ -1229,6 +1189,7 @@ void __cdecl HookPoolDelete(void* p) {
 		VirtualFree(p, 0, MEM_RELEASE);
 		g_poolMem = nullptr;
 		g_sceneForSlots = nullptr;
+		TrainingPositionEnd();
 		Log("POOL: object pool %p freed (battle over)", p);
 		return;
 	}
@@ -1513,8 +1474,18 @@ void PatchIat(DWORD slotVa, void* hook, void** orig) {
 	*slot = hook;
 	VirtualProtect(slot, sizeof(void*), old, &old);
 }
+struct VersionFile { const char* path; DWORD size; DWORD crc; };
+#include "versions_manifest.inc"
 std::string g_versionName = "cse";
 std::string g_versionDir;
+bool VersionFileListed(const std::string& version, const std::string& rel) {
+	static const std::set<std::string> listed = [] {
+		std::set<std::string> s;
+		for (const VersionFile& f : kVersionFiles) s.insert(f.path);
+		return s;
+	}();
+	return listed.count(version + "\\" + rel) != 0;
+}
 CRITICAL_SECTION g_versionLock;
 std::string g_versionLoaded;
 void NoteVersionLoad(const std::string& path) {
@@ -1539,9 +1510,9 @@ CreateFileW_t g_origCreateFileW = nullptr;
 std::string VersionPath(const std::string& path) {
 	EnterCriticalSection(&g_versionLock);
 	const std::string root = g_versionDir;
-	const bool cseOnly = g_versionName == "cse";
+	const std::string version = g_versionName;
 	LeaveCriticalSection(&g_versionLock);
-	if (root.empty() || path.empty()) return std::string();
+	if (root.empty() || path.empty() || version == "cse") return std::string();
 	std::string p = path;
 	for (char& c : p)
 		if (c == '/') c = '\\';
@@ -1555,7 +1526,7 @@ std::string VersionPath(const std::string& path) {
 		if (k != std::string::npos) at = k + 6;
 	}
 	if (at == std::string::npos) return std::string();
-	if (cseOnly && low.compare(at, 4, "etc\\") != 0) return std::string();
+	if (!VersionFileListed(version, low.substr(at))) return std::string();
 	const std::string alt = root + p.substr(at);
 	return GetFileAttributesA(alt.c_str()) == INVALID_FILE_ATTRIBUTES ? std::string() : alt;
 }
@@ -1612,6 +1583,13 @@ void InstallVersionSelect() {
 	InitializeCriticalSection(&g_versionLock);
 	PatchIat(kIatCreateFileA, reinterpret_cast<void*>(&HookCreateFileA), reinterpret_cast<void**>(&g_origCreateFileA));
 	PatchIat(kIatCreateFileW, reinterpret_cast<void*>(&HookCreateFileW), reinterpret_cast<void**>(&g_origCreateFileW));
+}
+void CheckVersionFiles();
+void LoadVersionChoice() {
+	static bool done = false;
+	if (done) return;
+	done = true;
+	CheckVersionFiles();
 	LoadSavedVersion();
 }
 std::string VersionsRoot() { return ModuleDir(g_self) + "bbcse-versions\\"; }
@@ -1657,11 +1635,17 @@ void MakeBorderless(void* pp) {
 	static bool logged = false;
 	if (!logged) { logged = true; Log("DISPLAY: borderless window %ldx%ld (back buffer %ux%u)", r.right - r.left, r.bottom - r.top, p->BackBufferWidth, p->BackBufferHeight); }
 }
+bool NetSessionActive();
 HRESULT __stdcall HookReset(void* dev, void* pp) {
 	if (g_vsyncWanted) ForceImmediate(pp, "Reset");
 	Overlay_BeforeReset();
 	const HRESULT hr = g_origReset(dev, pp);
 	if (hr >= 0) { Overlay_AfterReset(); MakeBorderless(pp); }
+	static HRESULT s_lastReset = 1;
+	if (hr != s_lastReset) {
+		s_lastReset = hr;
+		Log("DISPLAY: device reset %08lX%s", hr, NetSessionActive() ? ", online match" : "");
+	}
 	return hr;
 }
 using Present_t = HRESULT(__stdcall*)(void* dev, const void* src, const void* dst, HWND wnd, const void* dirty);
@@ -1809,6 +1793,7 @@ void CollectHitboxScene() {
 void VersionSyncTick();
 void PaletteSyncTick();
 HRESULT __stdcall HookPresent(void* dev, const void* src, const void* dst, HWND wnd, const void* dirty) {
+	LoadVersionChoice();
 	VersionSyncTick();
 	PaletteSyncTick();
 	const bool training = *reinterpret_cast<int*>(Live(kGameModeVa)) == kModeTraining;
@@ -1828,6 +1813,12 @@ HRESULT __stdcall HookPresent(void* dev, const void* src, const void* dst, HWND 
 	Overlay_OnPresent(static_cast<IDirect3DDevice9*>(dev));
 	const double t0 = QpcNowUs();
 	const HRESULT hr = g_origPresent(dev, src, dst, wnd, dirty);
+	static bool s_presentFailed = false;
+	if ((hr < 0) != s_presentFailed) {
+		s_presentFailed = hr < 0;
+		if (s_presentFailed) Log("DISPLAY: Present failed %08lX%s", hr, NetSessionActive() ? ", online match" : "");
+		else Log("DISPLAY: Present ok");
+	}
 	PaceAfterPresent((QpcNowUs() - t0) / 1000.0);
 	if (g_waitAfterPresent) {
 		g_waitAfterPresent = false;
@@ -2159,6 +2150,7 @@ struct NetState {
 	DWORD seed = 0;
 	void* scene = nullptr;
 } g_net;
+bool NetSessionActive() { return g_net.session != nullptr; }
 bool g_netActive = false;
 bool g_spectating = false;
 LONG g_specRngFixes = 0;
@@ -2332,6 +2324,105 @@ LONG g_rbDepthMaxSec = 0;
 constexpr DWORD kPosXOff = 0x248, kPosYOff = 0x24C, kCharStrideOff = 0x20140;
 int g_rbShownPos[2][2] = {};
 LONG g_jumps = 0, g_jumpMaxPx = 0, g_jumpsLogged = 0;
+constexpr DWORD kFlowFlagsOff = 0x62658, kFlowStateOff = 0x62680, kFlowSubOff = 0x62684, kFadeStart = 0x4397A0;
+constexpr DWORD kTutMgr = 0x1704A68, kTutCornerArmOff = 0x1F58, kScreenMgr = 0xE78400, kCamPrevXOff = 0xDC;
+constexpr DWORD kCornerRight = 0x40000, kCornerLeft = 0x20000;
+constexpr int kCornerNear = 1465000, kCornerFar = 1865000, kCenterX = 260000;
+static int s_posPending = 0, s_posTicks = 0, s_posTarget[2] = {};
+static bool s_posFlags = false;
+static bool TrainingFight() {
+	return g_poolMem && SceneFighting() && *reinterpret_cast<int*>(Live(kGameModeVa)) == kModeTraining;
+}
+static int HumanSide() {
+	const BYTE* gm = Live(kGameMgr);
+	return *reinterpret_cast<const int*>(gm + 0x10) != 1 && *reinterpret_cast<const int*>(gm + 0x168 + 0x10) == 1 ? 1 : 0;
+}
+static bool CornerRight() { return (g_posPreset == 1 ? HumanSide() : 1 - HumanSide()) == 1; }
+static void ClearCornerFlags() {
+	if (!s_posFlags) return;
+	*reinterpret_cast<DWORD*>(Live(kTutMgr)) &= ~(kCornerRight | kCornerLeft);
+	*reinterpret_cast<int*>(Live(kTutMgr) + kTutCornerArmOff) = 0;
+	s_posFlags = false;
+}
+static void ArmCornerFlags() {
+	ClearCornerFlags();
+	if (g_posPreset == 0) return;
+	*reinterpret_cast<DWORD*>(Live(kTutMgr)) |= CornerRight() ? kCornerRight : kCornerLeft;
+	*reinterpret_cast<int*>(Live(kTutMgr) + kTutCornerArmOff) = 1;
+	s_posFlags = true;
+}
+void TrainingPositionEnd() {
+	s_posPending = 0;
+	ClearCornerFlags();
+}
+constexpr DWORD kTrainingMenu = 0x16E7B58, kMenuOpenCountOff = 0x1ADF4;
+static void TrainingMenuUnstick() {
+	BYTE* menu = Live(kTrainingMenu);
+	int& count = *reinterpret_cast<int*>(menu + kMenuOpenCountOff);
+	if ((*reinterpret_cast<DWORD*>(menu) & 0xD) == 5 && count > 0) {
+		count = 0;
+		Log("TRAINING: hidden menu released");
+	}
+}
+static void TrainingPositionTick() {
+	if (!TrainingFight()) { s_posPending = 0; ClearCornerFlags(); return; }
+	TrainingMenuUnstick();
+	if (g_origIsPaused()) return;
+	BYTE* mgr = Live(kObjMgr);
+	if (s_posPending != 1 && *reinterpret_cast<int*>(mgr + kFlowStateOff) == 3 && *reinterpret_cast<int*>(mgr + kFlowSubOff) == 1) {
+		if (g_posPreset == 0 && !g_posRight) {
+			s_posPending = 0;
+			ClearCornerFlags();
+			return;
+		}
+		ArmCornerFlags();
+		s_posPending = 1;
+		s_posTicks = 0;
+		Log("POS: reset (preset %d, swap %d, human side %d)", g_posPreset, g_posRight, HumanSide());
+	}
+	if (!s_posPending) return;
+	if (s_posPending == 1) {
+		if (*reinterpret_cast<int*>(mgr + kFlowSubOff) == 0) { s_posPending = 2; s_posTicks = 0; }
+		else if (++s_posTicks > 300) { s_posPending = 0; ClearCornerFlags(); Log("POS: no restart after 300 frames"); }
+		return;
+	}
+	BYTE* chars = *reinterpret_cast<BYTE**>(mgr + kCharsPtrOff);
+	if (!chars) { s_posPending = 0; ClearCornerFlags(); return; }
+	int* x[2] = {reinterpret_cast<int*>(chars + kPosXOff), reinterpret_cast<int*>(chars + kCharStrideOff + kPosXOff)};
+	if (s_posPending == 2) {
+		if (++s_posTicks < 2) return;
+		if (g_posPreset == 0) {
+			s_posTarget[0] = -kCenterX;
+			s_posTarget[1] = kCenterX;
+		} else if (CornerRight()) {
+			s_posTarget[0] = kCornerNear;
+			s_posTarget[1] = kCornerFar;
+		} else {
+			s_posTarget[0] = -kCornerFar;
+			s_posTarget[1] = -kCornerNear;
+		}
+		int cam = g_posPreset == 0 ? 0 : CornerRight() ? 0x500 : -0x500;
+		if (g_posRight) {
+			s_posTarget[0] = -s_posTarget[0];
+			s_posTarget[1] = -s_posTarget[1];
+			cam = -cam;
+		}
+		*reinterpret_cast<int*>(Live(kScreenMgr) + kCamPrevXOff) = cam;
+		Log("POS: P1 %d P2 %d -> P1 %d P2 %d, camera %d", *x[0], *x[1], s_posTarget[0], s_posTarget[1], cam);
+		ClearCornerFlags();
+		s_posPending = 3;
+		s_posTicks = 0;
+	}
+	++s_posTicks;
+	const bool moved0 = *x[0] - s_posTarget[0] > 100000 || s_posTarget[0] - *x[0] > 100000;
+	const bool moved1 = *x[1] - s_posTarget[1] > 100000 || s_posTarget[1] - *x[1] > 100000;
+	if (s_posTicks <= 4 || (s_posTicks <= 20 && moved0 && moved1)) {
+		if (s_posTicks > 4) Log("POS: moved back at frame %d (P1 %d P2 %d), placing again", s_posTicks, *x[0], *x[1]);
+		*x[0] = s_posTarget[0];
+		*x[1] = s_posTarget[1];
+	}
+	if (s_posTicks >= 20) { s_posPending = 0; Log("POS: done, P1 %d P2 %d", *x[0], *x[1]); }
+}
 bool ReadFighterPos(int out[2][2]) {
 	const BYTE* chars = *reinterpret_cast<BYTE**>(Live(kObjMgr) + kCharsPtrOff);
 	if (!chars) return false;
@@ -3329,6 +3420,7 @@ void __fastcall HookUpdateBattle(void* self, void* edx, int arg) {
 		const unsigned char* const* objects = *reinterpret_cast<const unsigned char* const* const*>(mgr + 0x62648);
 		FrameData_Update(chars, chars ? chars + 0x20140 : nullptr, ++s_trainingFrame, objects, objects ? objectCount : 0);
 	}
+	TrainingPositionTick();
 	if (walled && SceneFighting()) RngMarkTick();
 	else g_rngAfterValid = false;
 	if (walled) SpectatorSync();
@@ -3425,7 +3517,13 @@ bool FollowsCall(DWORD v) {
 	}
 }
 
+LONG CALLBACK CrashCaptureInner(EXCEPTION_POINTERS* ep);
 LONG CALLBACK CrashCapture(EXCEPTION_POINTERS* ep) {
+	if (t_probing) return EXCEPTION_CONTINUE_SEARCH;
+	ProbeScope probing;
+	return CrashCaptureInner(ep);
+}
+LONG CALLBACK CrashCaptureInner(EXCEPTION_POINTERS* ep) {
 	const DWORD code = ep->ExceptionRecord->ExceptionCode;
 	const bool cxx = code == 0xE06D7363;
 	const bool fatal = code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_STACK_OVERFLOW ||
@@ -3537,7 +3635,11 @@ void RoomOwnerName(int index, BYTE* out) {
 
 void* __fastcall HookRoomInfo(void* self, void* edx, int index, BYTE* out) {
 	void* r = g_origRoomInfo(self, edx, index, out);
-	if (out && *reinterpret_cast<int*>(out + 0x54)) RoomOwnerName(index, out);
+	if (out && *reinterpret_cast<int*>(out + 0x54)) {
+		++t_probing;
+		RoomOwnerName(index, out);
+		--t_probing;
+	}
 	return r;
 }
 
@@ -3680,6 +3782,7 @@ void InstallTickHook() {
 	Log("tick hook installed (%u call sites)", static_cast<unsigned>(sizeof(patches) / sizeof(patches[0])));
 	PatchIat(kIatPerspectiveFov, reinterpret_cast<void*>(&HookPerspectiveFov), reinterpret_cast<void**>(&g_origPerspectiveFov));
 	InstallVersionSelect();
+	LoadVersionChoice();
 #ifdef BBCSE_DEV_TOOLS
 	InstallInputProbe();
 #endif
@@ -3787,33 +3890,70 @@ bool g_passive = false;
 std::string g_userVersion = "cse";
 std::string g_forcedVersion;
 std::string g_forcedReason;
-std::map<std::string, DWORD> g_versionHashes;
 
-DWORD HashFolder(const std::string& root, const std::string& rel, DWORD h) {
-	std::vector<std::string> names;
-	WIN32_FIND_DATAA fd{};
-	const HANDLE f = FindFirstFileA((root + rel + "*").c_str(), &fd);
-	if (f == INVALID_HANDLE_VALUE) return h;
-	do {
-		if (fd.cFileName[0] == '.') continue;
-		std::string n = fd.cFileName;
-		for (char& c : n) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
-		names.push_back(n + ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? "\\" : ""));
-	} while (FindNextFileA(f, &fd));
-	FindClose(f);
-	std::sort(names.begin(), names.end());
-	for (const std::string& n : names) {
-		for (char c : rel + n) h = (h ^ static_cast<BYTE>(c)) * 16777619u;
-		if (n.back() == '\\') {
-			h = HashFolder(root, rel + n, h);
-			continue;
+std::map<std::string, int> g_versionStates;
+std::string g_versionProblem;
+DWORD Crc32(DWORD crc, const BYTE* p, size_t n) {
+	static DWORD table[256];
+	static bool ready = false;
+	if (!ready) {
+		for (DWORD i = 0; i < 256; ++i) {
+			DWORD c = i;
+			for (int k = 0; k < 8; ++k) c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+			table[i] = c;
 		}
-		WIN32_FILE_ATTRIBUTE_DATA a{};
-		if (!GetFileAttributesExA((root + rel + n).c_str(), GetFileExInfoStandard, &a)) continue;
-		for (DWORD v : {a.nFileSizeLow, a.nFileSizeHigh})
-			for (int i = 0; i < 4; ++i) h = (h ^ ((v >> (8 * i)) & 0xFF)) * 16777619u;
+		ready = true;
 	}
-	return h;
+	crc = ~crc;
+	while (n--) crc = table[(crc ^ *p++) & 0xFF] ^ (crc >> 8);
+	return ~crc;
+}
+bool VersionFileOk(const VersionFile& f) {
+	FILE* fp = nullptr;
+	if (fopen_s(&fp, (VersionsRoot() + f.path).c_str(), "rb") || !fp) return false;
+	static BYTE buf[0x10000];
+	DWORD crc = 0, total = 0;
+	size_t got;
+	while ((got = fread(buf, 1, sizeof(buf), fp)) > 0) {
+		crc = Crc32(crc, buf, got);
+		total += static_cast<DWORD>(got);
+	}
+	fclose(fp);
+	return total == f.size && crc == f.crc;
+}
+int VersionState(const std::string& name) {
+	const auto it = g_versionStates.find(name);
+	if (it != g_versionStates.end()) return it->second;
+	if (GetFileAttributesA((VersionsRoot() + name).c_str()) == INVALID_FILE_ATTRIBUTES) return 0;
+	const std::string prefix = name + "\\";
+	int files = 0, bad = 0;
+	std::string first;
+	for (const VersionFile& f : kVersionFiles) {
+		if (strncmp(f.path, prefix.c_str(), prefix.size()) != 0) continue;
+		++files;
+		if (VersionFileOk(f)) continue;
+		if (first.empty()) first = f.path;
+		++bad;
+	}
+	if (files == 0) return 0;
+	const int state = bad ? 2 : 1;
+	if (bad) {
+		Log("VERSION: %s off, %d of %d files missing or different (first: %s)", name.c_str(), bad, files, first.c_str());
+		g_versionProblem += (g_versionProblem.empty() ? "" : ", ") + name;
+	} else {
+		Log("VERSION: %s files ok", name.c_str());
+	}
+	g_versionStates[name] = state;
+	return state;
+}
+void CheckVersionFiles() {
+	std::set<std::string> names;
+	for (const VersionFile& f : kVersionFiles) {
+		const char* slash = strchr(f.path, '\\');
+		if (slash) names.insert(std::string(f.path, slash));
+	}
+	for (const std::string& n : names)
+		if (GetFileAttributesA((VersionsRoot() + n).c_str()) != INVALID_FILE_ATTRIBUTES) VersionState(n);
 }
 
 bool VersionNameOk(const std::string& name) {
@@ -3826,29 +3966,30 @@ bool VersionNameOk(const std::string& name) {
 DWORD VersionHash(const std::string& name) {
 	if (name == "cse") return 0;
 	if (!VersionNameOk(name)) return 1;
-	const auto it = g_versionHashes.find(name);
-	if (it != g_versionHashes.end()) return it->second;
-	const std::string dir = VersionsRoot() + name + "\\";
-	if (GetFileAttributesA(dir.c_str()) == INVALID_FILE_ATTRIBUTES) return 1;
-	const DWORD h = HashFolder(dir, "", 2166136261u) | 2;
-	g_versionHashes[name] = h;
-	return h;
+	if (VersionState(name) != 1) return 1;
+	const std::string prefix = name + "\\";
+	DWORD h = 2166136261u;
+	for (const VersionFile& f : kVersionFiles) {
+		if (strncmp(f.path, prefix.c_str(), prefix.size()) != 0) continue;
+		for (const char* c = f.path; *c; ++c) h = (h ^ static_cast<BYTE>(*c)) * 16777619u;
+		for (DWORD v : {f.size, f.crc})
+			for (int i = 0; i < 4; ++i) h = (h ^ ((v >> (8 * i)) & 0xFF)) * 16777619u;
+	}
+	return h | 2;
 }
 
 bool ApplyVersion(const std::string& name) {
 	if (!VersionNameOk(name)) return false;
 	std::string dir = VersionsRoot() + name + "\\";
-	if (GetFileAttributesA(dir.c_str()) == INVALID_FILE_ATTRIBUTES) {
-		if (name != "cse") return false;
-		dir.clear();
-	}
+	if (name == "cse") dir.clear();
+	else if (VersionState(name) != 1) return false;
 	if (name == g_versionName) return true;
 	EnterCriticalSection(&g_versionLock);
 	g_versionName = name;
 	g_versionDir = dir;
 	LeaveCriticalSection(&g_versionLock);
 	g_versionRedirects = 0;
-	Log("VERSION: %s selected%s", g_versionName.c_str(), dir.empty() ? " (game files)" : "");
+	Log("VERSION: %s selected", g_versionName.c_str());
 	ApplyVersionRules();
 	return true;
 }
@@ -3859,13 +4000,7 @@ void LoadSavedVersion() {
 	std::string want = saved;
 	for (char& c : want) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
 	const std::string dir = VersionsRoot() + want + "\\";
-	if (want == "cse" || !VersionNameOk(want) || GetFileAttributesA(dir.c_str()) == INVALID_FILE_ATTRIBUTES) {
-		const std::string cseDir = VersionsRoot() + "cse\\";
-		if (GetFileAttributesA(cseDir.c_str()) != INVALID_FILE_ATTRIBUTES) {
-			EnterCriticalSection(&g_versionLock);
-			g_versionDir = cseDir;
-			LeaveCriticalSection(&g_versionLock);
-		}
+	if (want == "cse" || !VersionNameOk(want) || VersionState(want) != 1) {
 		Log("VERSION: cse (choose another in the IM BBCS:EX menu, F2)");
 		return;
 	}
@@ -3979,7 +4114,7 @@ void VersionSyncTick() {
 			memcpy(name, &msg[1], 8);
 			std::string want = name;
 			for (char& c : want) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
-			if (VersionNameOk(want) && VersionHash(want) == msg[3] && (want == "cse" || GetFileAttributesA((VersionsRoot() + want).c_str()) != INVALID_FILE_ATTRIBUTES)) {
+			if (VersionNameOk(want) && VersionHash(want) == msg[3] && (want == "cse" || VersionState(want) == 1)) {
 				SetForced(want, "host picked");
 			} else {
 				DWORD out[4] = {kVerCannot, 0, 0, 0};
@@ -4084,6 +4219,17 @@ void PaletteSyncTick() {
 }
 
 }
+int g_posPreset = 0;
+bool g_posRight = false;
+void Training_ResetPosition() {
+	if (!TrainingFight() || g_origIsPaused() || NetSessionActive()) return;
+	BYTE* mgr = Live(kObjMgr);
+	if (*reinterpret_cast<int*>(mgr + kFlowStateOff) != 3 || *reinterpret_cast<int*>(mgr + kFlowSubOff) != 0) return;
+	*reinterpret_cast<int*>(mgr + kFlowSubOff) = 1;
+	DWORD& flags = *reinterpret_cast<DWORD*>(mgr + kFlowFlagsOff);
+	flags = (flags & ~0x80u) | 0x20000u;
+	reinterpret_cast<void(__cdecl*)(int)>(Live(kFadeStart))(0x1e);
+}
 
 void Palette_Log(const char* text) { Log("%s", text); }
 
@@ -4093,10 +4239,14 @@ void Version_List(std::vector<std::string>& out) {
 	const HANDLE h = FindFirstFileA((VersionsRoot() + "*").c_str(), &fd);
 	if (h == INVALID_HANDLE_VALUE) return;
 	do {
-		if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && fd.cFileName[0] != '.' && _stricmp(fd.cFileName, "cse") != 0) out.push_back(fd.cFileName);
+		if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || fd.cFileName[0] == '.') continue;
+		std::string name = fd.cFileName;
+		for (char& c : name) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+		if (name != "cse" && VersionState(name) == 1) out.push_back(name);
 	} while (FindNextFileA(h, &fd));
 	FindClose(h);
 }
+const char* Version_Problem() { return g_versionProblem.c_str(); }
 int Save_UnlockGallery() {
 	if (g_poolMem) return -1;
 	const std::string dir = ModuleDir(g_self) + "Save\\";
@@ -4140,8 +4290,6 @@ void Version_Select(const char* name) {
 	for (char& c : want) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
 	if (!ApplyVersion(want)) return;
 	g_userVersion = want;
-	g_versionHashes.erase(want);
-	VersionHash(want);
 	WritePrivateProfileStringA("menu", "version", want.c_str(), (ModuleDir(g_self) + "bbcse-im.ini").c_str());
 }
 
@@ -4149,6 +4297,7 @@ extern "C" HRESULT WINAPI DirectInput8Create(HINSTANCE inst, DWORD version, REFI
                                              LPVOID* out, LPUNKNOWN outer) {
 	if (g_passive) return LoadRealDinput() ? g_realCreate(inst, version, iid, out, outer) : E_FAIL;
 	InstallTickHook();
+	LoadVersionChoice();
 	if (!LoadRealDinput()) {
 		MessageBoxA(nullptr,
 			"Could not load the real dinput8.dll.",

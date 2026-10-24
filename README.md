@@ -32,6 +32,7 @@ Training:
 - F3 frame advantage: startup, hit/block advantage, invul. Follow-ups (214A~214D) get their own startup.
 - F4 hitboxes.
 - Palette editor.
+- Position reset (F5 or Select): center, me in the corner, opponent in the corner, swap sides.
 
 Online:
 
@@ -43,6 +44,7 @@ Version select:
 
 - CSE, CS2, CS1. Characters, system rules and HUD from that version.
 - Files in `bbcse-versions`.
+- Files are checked at start. A version with missing or changed files is turned off: copy `bbcse-versions` from the zip again. Only the shipped `cs1` and `cs2` folders are used.
 - Online: the lobby host's pick applies to the room.
 - CS2/CS1: version shown top center during the fight.
 - CS1 is version 1.02, CS2 is version 1.03 (2.0). Relius and Platinum work against them.
