@@ -77,6 +77,7 @@ struct SideState {
 	std::string selected;
 	bool editorChoice = false;
 	std::vector<PalData> custom;
+	int refreshStep = 0;
 };
 
 struct Change {
@@ -148,6 +149,11 @@ void ReadAll(int side, unsigned char (&out)[kFiles][kFileBytes]) {
 	}
 }
 
+void RefreshGameFiles(int side) {
+	for (int f = 0; f < kFiles; ++f)
+		if (unsigned char* e = Entry(side, g_side[side].palIndex, f)) *reinterpret_cast<int*>(e + kEntryDirtyOff) = 1;
+}
+
 void ApplyFile(int side, int file, const unsigned char* colors) {
 	Backup(side);
 	WriteGameFile(side, file, colors);
@@ -164,6 +170,7 @@ void ApplyFiles(int side, const unsigned char (*files)[kFileBytes]) {
 	const SideState& s = g_side[side];
 	for (int f = 0; f < kFiles; ++f)
 		WriteGameFile(side, f, files && !IsEmpty(files[f]) ? files[f] : s.original[f]);
+	g_side[side].refreshStep = 1;
 }
 
 std::string GameDir() {
@@ -389,8 +396,6 @@ std::map<unsigned int, unsigned int> s_opSizes;
 
 void LoadOpSizes() {
 	if (!s_opSizes.empty() || !g_paletteScene.opSizes) return;
-	const unsigned int* pre = reinterpret_cast<const unsigned int*>(g_paletteScene.opSizes - 0x30);
-	for (int i = 0; i < 6; ++i) s_opSizes[pre[i * 2]] = pre[i * 2 + 1];
 	const unsigned int* table = reinterpret_cast<const unsigned int*>(g_paletteScene.opSizes);
 	for (int i = 0; i < 963; ++i) s_opSizes.emplace(table[i * 2], table[i * 2 + 1]);
 }
@@ -1417,6 +1422,16 @@ void Palette_Tick() {
 		if (!c || !list) continue;
 		const int palIndex = *reinterpret_cast<const int*>(g_paletteScene.gameInfo + kPalIndexOff + side * kPalIndexStride);
 		const std::string code(reinterpret_cast<const char*>(c + kCharCodeOff), strnlen(reinterpret_cast<const char*>(c + kCharCodeOff), 4));
+		if (s.refreshStep) {
+			const unsigned char* e = list == s.list ? Entry(side, s.palIndex, 0) : nullptr;
+			if (!e) s.refreshStep = 0;
+			else if (s.refreshStep == 1) {
+				if (*reinterpret_cast<const int*>(e + kEntryDirtyOff) == 0) s.refreshStep = 2;
+			} else if (++s.refreshStep > 3) {
+				RefreshGameFiles(side);
+				s.refreshStep = 0;
+			}
+		}
 		if (list == s.list && palIndex == s.palIndex && code == s.code) continue;
 		const bool newCharacter = code != s.code;
 		const bool sameMatch = list == s.list && !newCharacter;
@@ -1472,7 +1487,7 @@ void Palette_DrawEditor() {
 		StopHighlight();
 		SyncEditor();
 	}
-	static int startColor = 0;
+	static int startColor = 1;
 	ImGui::SetNextItemWidth(120);
 	ImGui::SliderInt("##startcolor", &startColor, 1, kGameColors, "Color %d");
 	ImGui::SameLine();

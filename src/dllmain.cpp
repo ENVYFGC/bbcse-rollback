@@ -2058,8 +2058,8 @@ void InstallVsyncOff(HMODULE self) {
 	const std::string ini = ModuleDir(self) + "bbcse-net.ini";
 	char mode[16] = {};
 	GetPrivateProfileStringA("net", "mode", "", mode, sizeof(mode), ini.c_str());
-	if (_stricmp(mode, "steam") == 0) {
-		g_vsyncWanted = GetPrivateProfileIntA("net", "vsync", 0, ini.c_str()) == 0;
+	if (_stricmp(mode, "steam") == 0) g_vsyncWanted = GetPrivateProfileIntA("net", "vsync", 0, ini.c_str()) == 0;
+	if (mode[0]) {
 		g_renderW = GetPrivateProfileIntA("display", "renderwidth", 0, ini.c_str());
 		g_renderH = GetPrivateProfileIntA("display", "renderheight", 0, ini.c_str());
 		g_borderless = GetPrivateProfileIntA("display", "borderless", 0, ini.c_str()) != 0;
@@ -2364,6 +2364,28 @@ static void TrainingMenuUnstick() {
 		Log("TRAINING: hidden menu released");
 	}
 }
+constexpr DWORD kActNameOff = 0x1EC0, kFacingOff = 0x244;
+constexpr int kDollSpawnX = 460000, kDollBehind = 200000, kDollFront = 110000;
+static void PlaceCarlDolls(const BYTE* chars) {
+	if (!g_poolMem) return;
+	for (DWORD i = 0; i < 400; ++i) {
+		BYTE* o = g_poolMem + kPoolObjOff + i * kPoolStride;
+		if (*reinterpret_cast<const int*>(o + 0x10) != 1 || !*reinterpret_cast<void* const*>(o + 0x4C)) continue;
+		if (strncmp(reinterpret_cast<const char*>(o + kActNameOff), "Nirvana", 7) != 0) continue;
+		int& dollX = *reinterpret_cast<int*>(o + kPosXOff);
+		for (int side = 0; side < 2; ++side) {
+			if (dollX != (side ? kDollSpawnX : -kDollSpawnX)) continue;
+			if (strncmp(reinterpret_cast<const char*>(chars + side * kCharStrideOff + 0x20E8), "ca", 3) != 0) break;
+			const int carl = s_posTarget[side], other = s_posTarget[1 - side];
+			const int back = carl < other ? -1 : 1;
+			const int behind = carl + back * kDollBehind;
+			dollX = behind >= -kCornerFar && behind <= kCornerFar ? behind : carl - back * kDollFront;
+			*reinterpret_cast<int*>(o + kFacingOff) = carl < other ? 0 : 1;
+			Log("POS: P%d doll %d -> %d", side + 1, side ? kDollSpawnX : -kDollSpawnX, dollX);
+			break;
+		}
+	}
+}
 static void TrainingPositionTick() {
 	if (!TrainingFight()) { s_posPending = 0; ClearCornerFlags(); return; }
 	TrainingMenuUnstick();
@@ -2421,6 +2443,7 @@ static void TrainingPositionTick() {
 		*x[0] = s_posTarget[0];
 		*x[1] = s_posTarget[1];
 	}
+	PlaceCarlDolls(chars);
 	if (s_posTicks >= 20) { s_posPending = 0; Log("POS: done, P1 %d P2 %d", *x[0], *x[1]); }
 }
 bool ReadFighterPos(int out[2][2]) {
@@ -2431,6 +2454,32 @@ bool ReadFighterPos(int out[2][2]) {
 		out[c][1] = *reinterpret_cast<const int*>(chars + c * kCharStrideOff + kPosYOff);
 	}
 	return true;
+}
+constexpr DWORD kEff3DAllocSiteA = 0x4C1DFF, kEff3DAllocSiteB = 0x532D37, kEff3DAllocFn = 0x451B60, kEff3DFreeFn = 0x451C20;
+using Eff3DAlloc_t = unsigned(__fastcall*)(void* mgr);
+using Eff3DFree_t = int(__fastcall*)(void* mgr, void* edx, unsigned slot);
+Eff3DAlloc_t g_origEff3DAlloc = nullptr;
+struct Eff3DGrant { void* mgr; unsigned slot; int frame; };
+std::vector<Eff3DGrant> g_eff3dGrants;
+unsigned __fastcall HookEff3DAlloc(void* mgr) {
+	const unsigned slot = g_origEff3DAlloc(mgr);
+	if (g_net.session && slot != 0xFFFFFFFFu) {
+		if (g_eff3dGrants.size() > 256) g_eff3dGrants.erase(g_eff3dGrants.begin(), g_eff3dGrants.begin() + 128);
+		g_eff3dGrants.push_back({mgr, slot, g_net.frame});
+	}
+	return slot;
+}
+void ReleaseEff3DGrantsFrom(int frame) {
+	const auto release = reinterpret_cast<Eff3DFree_t>(Live(kEff3DFreeFn));
+	int freed = 0;
+	for (auto it = g_eff3dGrants.begin(); it != g_eff3dGrants.end();) {
+		if (it->frame < frame) { ++it; continue; }
+		const BYTE* slots = *reinterpret_cast<BYTE* const*>(it->mgr);
+		if (slots && *reinterpret_cast<const int*>(slots + it->slot * 8)) { release(it->mgr, nullptr, it->slot); ++freed; }
+		it = g_eff3dGrants.erase(it);
+	}
+	static LONG s_logged = 0;
+	if (freed && s_logged < 20) { ++s_logged; Log("NET: rollback to frame %d released %d 3D effect slot(s)", frame, freed); }
 }
 bool __cdecl NetLoad(unsigned char* buf, int) {
 	struct Add { double t0; ~Add() { g_msLoad += NowMs() - t0; } } add{NowMs()};
@@ -2444,6 +2493,7 @@ bool __cdecl NetLoad(unsigned char* buf, int) {
 		ReadFighterPos(g_rbShownPos);
 	}
 	if (!LoadSlot(*s)) { Log("NET: load FAILED (frame %ld): regions moved. Desync likely.", s->frame); return false; }
+	ReleaseEff3DGrantsFrom(s->frame);
 	g_net.frame = s->frame;
 	return true;
 }
@@ -2974,6 +3024,7 @@ void NetStop() {
 void ApplyVersionRules();
 void NetBattleStart() {
 	NetStop();
+	g_eff3dGrants.clear();
 	EnterCriticalSection(&g_versionLock);
 	g_versionLoaded.clear();
 	LeaveCriticalSection(&g_versionLock);
@@ -3662,6 +3713,7 @@ void InstallTickHook() {
 	g_origNetFetch = reinterpret_cast<NetFetch_t>(Live(kNetFetchFn));
 	g_origNetIndex = reinterpret_cast<NetIndex_t>(Live(kNetIndexFn));
 	g_origMatchMenu = reinterpret_cast<MatchMenu_t>(Live(kMatchMenuFn));
+	g_origEff3DAlloc = reinterpret_cast<Eff3DAlloc_t>(Live(kEff3DAllocFn));
 	g_origNetInputMsg = reinterpret_cast<NetMsg_t>(Live(kNetInputMsgFn));
 	g_origNetRelayMsg = reinterpret_cast<NetMsg_t>(Live(kNetRelayMsgFn));
 	g_origNetRelayReply = reinterpret_cast<NetMsg_t>(Live(kNetRelayReplyFn));
@@ -3698,6 +3750,8 @@ void InstallTickHook() {
 		{kPoolNewSite, kPoolNewFn, reinterpret_cast<void*>(&HookPoolNew)},
 		{kPoolDelSiteA, kOpDeleteFn, reinterpret_cast<void*>(&HookPoolDelete)},
 		{kPoolDelSiteB, kOpDeleteFn, reinterpret_cast<void*>(&HookPoolDelete)},
+		{kEff3DAllocSiteA, kEff3DAllocFn, reinterpret_cast<void*>(&HookEff3DAlloc)},
+		{kEff3DAllocSiteB, kEff3DAllocFn, reinterpret_cast<void*>(&HookEff3DAlloc)},
 	};
 
 	for (const Patch& pt : patches) {
